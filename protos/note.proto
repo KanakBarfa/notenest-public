@@ -1,0 +1,89 @@
+syntax = "proto3";
+
+package notenest.note;
+
+// Service defining note management methods
+service NoteService {
+  rpc CreateNote (CreateNoteRequest) returns (NoteResponse);
+  rpc GetNote (GetNoteRequest) returns (NoteResponse);
+  rpc ListNotes (ListNotesRequest) returns (ListNotesResponse);
+  rpc UpdateNote (UpdateNoteRequest) returns (NoteResponse);
+  rpc DeleteNote (DeleteNoteRequest) returns (DeleteNoteResponse);
+  rpc ShareNote (ShareNoteRequest) returns (ShareNoteResponse);
+  rpc GetSharedNotes (GetSharedNotesRequest) returns (ListNotesResponse);
+}
+
+message CreateNoteRequest {
+  string owner_id = 1;
+  string title = 2;
+  string content = 3;
+}
+
+message GetNoteRequest {
+  string note_id = 1;
+  string requesting_user_id = 2;
+}
+
+message ListNotesRequest {
+  string owner_id = 1;
+}
+
+message UpdateNoteRequest {
+  string note_id = 1;
+  string requesting_user_id = 2;
+  string title = 3;
+  string content = 4;
+}
+
+message DeleteNoteRequest {
+  string note_id = 1;
+  string requesting_user_id = 2;
+}
+
+message DeleteNoteResponse {
+  bool success = 1;
+}
+
+message ShareNoteRequest {
+  string note_id = 1;
+  string owner_id = 2;
+  string target_email = 3;
+}
+
+message ShareNoteResponse {
+  bool success = 1;
+  string target_user_id = 2;
+}
+
+message GetSharedNotesRequest {
+  string user_id = 1;
+}
+
+message NoteResponse {
+  string id = 1;
+  string title = 2;
+  string content = 3;
+  string owner_id = 4;
+  string created_at = 5;
+  string updated_at = 6;
+}
+
+message ListNotesResponse {
+  repeated NoteResponse notes = 1;
+}
+
+// Service defining notification callback methods
+service NotificationService {
+  rpc Notify (NotifyRequest) returns (NotifyResponse);
+}
+
+message NotifyRequest {
+  string user_id = 1;
+  string event_type = 2;
+  string payload = 3;
+}
+
+message NotifyResponse {
+  bool delivered = 1;
+}
+

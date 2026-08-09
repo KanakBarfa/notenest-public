@@ -1,0 +1,6 @@
+apiVersion: v2
+name: notenest
+description: Helm chart for NoteNest microservices on Kubernetes
+type: application
+version: 0.20.0
+appVersion: "0.20.0"

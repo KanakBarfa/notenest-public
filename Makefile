@@ -1,0 +1,54 @@
+CXX ?= g++
+STD_FLAG := $(shell $(CXX) -std=c++26 -E - < /dev/null >/dev/null 2>&1 && echo "-std=c++26" || ($(CXX) -std=c++2c -E - < /dev/null >/dev/null 2>&1 && echo "-std=c++2c" || echo "-std=c++20"))
+EXTRA_INCLUDES := $(shell pkg-config --cflags librdkafka++ librabbitmq 2>/dev/null || echo "")
+CXXFLAGS = $(STD_FLAG) -Wall -Wextra -O3 -pthread -Iinclude -Isrc/proto $(EXTRA_INCLUDES)
+
+SRC_DIR = src
+OBJ_DIR = obj
+PROTO_DIR = protos
+SRC_PROTO_DIR = src/proto
+TARGET = notenest
+
+PROTOS = $(wildcard $(PROTO_DIR)/*.proto)
+PROTO_CC_SRCS = $(PROTOS:$(PROTO_DIR)/%.proto=$(SRC_PROTO_DIR)/%.pb.cc) $(PROTOS:$(PROTO_DIR)/%.proto=$(SRC_PROTO_DIR)/%.grpc.pb.cc)
+
+CPP_SRCS = $(wildcard $(SRC_DIR)/*.cpp)
+CPP_OBJS = $(CPP_SRCS:$(SRC_DIR)/%.cpp=$(OBJ_DIR)/%.o)
+PROTO_OBJS = $(PROTO_CC_SRCS:$(SRC_PROTO_DIR)/%.cc=$(OBJ_DIR)/proto/%.o)
+OBJS = $(CPP_OBJS) $(PROTO_OBJS)
+
+GRPC_LDFLAGS := $(shell pkg-config --libs grpc++ protobuf 2>/dev/null || echo "-lgrpc++ -lgrpc -lprotobuf")
+LDFLAGS = -lpq -lsodium -lcrypto -lhiredis $(GRPC_LDFLAGS) -lgrpc++_reflection -lrdkafka++ -lrabbitmq
+GRPC_CPP_PLUGIN := $(shell which grpc_cpp_plugin 2>/dev/null || echo "/usr/bin/grpc_cpp_plugin")
+
+all: proto $(TARGET)
+
+proto: $(SRC_PROTO_DIR)
+	@if [ -n "$(PROTOS)" ]; then \
+		protoc --proto_path=$(PROTO_DIR) --cpp_out=$(SRC_PROTO_DIR) --grpc_out=$(SRC_PROTO_DIR) --plugin=protoc-gen-grpc=$(GRPC_CPP_PLUGIN) $(PROTOS); \
+	fi
+
+$(SRC_PROTO_DIR):
+	mkdir -p $(SRC_PROTO_DIR)
+
+$(TARGET): proto $(OBJS)
+	$(CXX) $(CXXFLAGS) -o $@ $(OBJS) $(LDFLAGS)
+
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp | $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c -o $@ $<
+
+$(PROTO_CC_SRCS): proto
+
+$(OBJ_DIR)/proto/%.o: $(SRC_PROTO_DIR)/%.cc | $(OBJ_DIR)/proto
+	$(CXX) $(CXXFLAGS) -c -o $@ $<
+
+$(OBJ_DIR):
+	mkdir -p $(OBJ_DIR)
+
+$(OBJ_DIR)/proto:
+	mkdir -p $(OBJ_DIR)/proto
+
+clean:
+	rm -rf $(OBJ_DIR) $(TARGET)
+
+.PHONY: all proto clean

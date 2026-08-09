@@ -1,0 +1,8 @@
+grpcio>=1.50.0
+grpcio-tools>=1.50.0
+grpcio-reflection>=1.50.0
+grpcio-health-checking>=1.50.0
+protobuf>=4.20.0
+psycopg2-binary>=2.9.0
+prometheus_client>=0.17.0
+requests>=2.28.0

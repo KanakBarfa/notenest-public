@@ -1,0 +1,7 @@
+environment       = "dev"
+postgres_user     = "postgres"
+postgres_password = "pass"
+postgres_db       = "postgres"
+postgres_port     = 5432
+kafka_port        = 9092
+prometheus_port   = 9090

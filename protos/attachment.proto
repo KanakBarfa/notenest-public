@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package notenest.attachment;
+
+// Service defining attachment management methods
+service AttachmentService {
+  rpc GenerateUploadUrl (GenerateUploadUrlRequest) returns (GenerateUploadUrlResponse);
+  rpc CompleteUpload (CompleteUploadRequest) returns (AttachmentResponse);
+  rpc DeleteAttachment (DeleteAttachmentRequest) returns (DeleteAttachmentResponse);
+  rpc ListAttachments (ListAttachmentsRequest) returns (ListAttachmentsResponse);
+}
+
+message GenerateUploadUrlRequest {
+  string note_id = 1;
+  string user_id = 2;
+  string filename = 3;
+}
+
+message GenerateUploadUrlResponse {
+  string attachment_id = 1;
+  string key = 2;
+  string upload_url = 3;
+}
+
+message CompleteUploadRequest {
+  string attachment_id = 1;
+  string note_id = 2;
+  string user_id = 3;
+  string filename = 4;
+  string object_key = 5;
+  int64 size_bytes = 6;
+}
+
+message DeleteAttachmentRequest {
+  string note_id = 1;
+  string attachment_id = 2;
+  string user_id = 3;
+}
+
+message DeleteAttachmentResponse {
+  bool success = 1;
+}
+
+message ListAttachmentsRequest {
+  string note_id = 1;
+  string user_id = 2;
+}
+
+message AttachmentResponse {
+  string id = 1;
+  string note_id = 2;
+  string filename = 3;
+  string object_key = 4;
+  int64 size_bytes = 5;
+  string created_at = 6;
+  string download_url = 7;
+}
+
+message ListAttachmentsResponse {
+  repeated AttachmentResponse attachments = 1;
+}

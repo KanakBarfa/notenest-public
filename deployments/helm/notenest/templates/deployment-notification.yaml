@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "notenest.fullname" . }}-notification
+  labels:
+    app.kubernetes.io/component: notification-service
+    {{- include "notenest.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.notification.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: notification-service
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: notification-service
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      containers:
+        - name: notification-service
+          image: "{{ .Values.notification.image.repository }}:{{ .Values.notification.image.tag }}"
+          imagePullPolicy: {{ .Values.notification.image.pullPolicy }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.notification.metricsPort }}
+          env:
+            - name: KAFKA_BROKERS
+              value: "kafka:9092"
+            - name: NOTE_SERVICE_URL
+              value: "{{ include "notenest.fullname" . }}-note:50054"
+            - name: REDIS_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "notenest.fullname" . }}-config
+                  key: REDIS_HOST
+            - name: REDIS_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "notenest.fullname" . }}-config
+                  key: REDIS_PORT
+            - name: RABBITMQ_URL
+              value: "amqp://guest:guest@rabbitmq:5672/"
+            - name: CONSUL_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "notenest.fullname" . }}-config
+                  key: CONSUL_HOST
+            - name: CONSUL_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "notenest.fullname" . }}-config
+                  key: CONSUL_PORT
+          resources:
+            {{- toYaml .Values.notification.resources | nindent 12 }}

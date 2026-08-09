@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "notenest.fullname" . }}-note
+  labels:
+    app.kubernetes.io/component: note-service
+    {{- include "notenest.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: {{ .Values.note.httpPort }}
+      targetPort: http
+    - name: grpc-note
+      port: {{ .Values.note.grpcNotePort }}
+      targetPort: grpc-note
+    - name: grpc-attach
+      port: {{ .Values.note.grpcAttachmentPort }}
+      targetPort: grpc-attach
+  selector:
+    app.kubernetes.io/component: note-service
+    app.kubernetes.io/instance: {{ .Release.Name }}

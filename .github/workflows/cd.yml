@@ -1,0 +1,92 @@
+name: CD - Continuous Deployment
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*.*.*' ]
+  workflow_dispatch:
+
+jobs:
+  build-and-push-ghcr:
+    name: Build & Push Container Images (GHCR)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Lowercase Repository Name
+        id: repo
+        run: |
+          echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> $GITHUB_OUTPUT
+          echo "repo=${GITHUB_REPOSITORY,,}" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ steps.repo.outputs.repo }}
+          tags: |
+            type=sha,format=long
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+
+      - name: Build and Push Core Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Build and Push Nginx Gateway Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./deployments/nginx.Dockerfile
+          push: true
+          tags: ghcr.io/${{ steps.repo.outputs.repo }}-nginx:${{ github.sha }}
+
+  deploy-k3s-helm:
+    name: Deploy to k3s Cluster (GitOps Helm Release)
+    needs: build-and-push-ghcr
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Lowercase Repository Name
+        id: repo
+        run: |
+          echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> $GITHUB_OUTPUT
+          echo "repo=${GITHUB_REPOSITORY,,}" >> $GITHUB_OUTPUT
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: v3.12.0
+
+      - name: Validate Helm Release Manifests (Cluster-Independent)
+        run: |
+          echo "Rendering NoteNest v0.23 Helm release manifests for k3s validation..."
+          helm template notenest deployments/helm/notenest \
+            --namespace notenest \
+            --set image.repository=ghcr.io/${{ steps.repo.outputs.repo }} \
+            --set image.tag=${{ github.sha }} \
+            > /dev/null
+          echo "Helm release manifests validated successfully for commit SHA: ${{ github.sha }}"

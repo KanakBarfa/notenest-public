@@ -1,0 +1,137 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "notenest.fullname" . }}-note
+  labels:
+    app.kubernetes.io/component: note-service
+    {{- include "notenest.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.note.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: note-service
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: note-service
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      containers:
+        - name: note-service
+          image: "{{ .Values.note.image.repository }}:{{ .Values.note.image.tag }}"
+          imagePullPolicy: {{ .Values.note.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.note.httpPort }}
+            - name: grpc-note
+              containerPort: {{ .Values.note.grpcNotePort }}
+            - name: grpc-attach
+              containerPort: {{ .Values.note.grpcAttachmentPort }}
+          env:
+            - name: DATABASE_URL
+              value: "host=$(DB_HOST) port=$(DB_PORT) dbname=$(DB_NAME) user=$(DB_USER) password=$(DB_PASSWORD)"
+            - name: REDIS_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "notenest.fullname" . }}-config
+                  key: REDIS_HOST
+            - name: REDIS_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "notenest.fullname" . }}-config
+                  key: REDIS_PORT
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "notenest.secretName" . }}
+                  key: JWT_SECRET
+            - name: DB_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "notenest.fullname" . }}-config
+                  key: DB_HOST
+            - name: DB_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "notenest.fullname" . }}-config
+                  key: DB_PORT
+            - name: DB_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "notenest.fullname" . }}-config
+                  key: DB_NAME
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "notenest.secretName" . }}
+                  key: DB_USER
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "notenest.secretName" . }}
+                  key: DB_PASSWORD
+            - name: MINIO_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "notenest.fullname" . }}-config
+                  key: MINIO_ENDPOINT
+            - name: MINIO_EXTERNAL_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "notenest.fullname" . }}-config
+                  key: MINIO_EXTERNAL_ENDPOINT
+            - name: MINIO_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "notenest.fullname" . }}-config
+                  key: MINIO_BUCKET
+            - name: MINIO_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "notenest.secretName" . }}
+                  key: MINIO_ACCESS_KEY
+            - name: MINIO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "notenest.secretName" . }}
+                  key: MINIO_SECRET_KEY
+            - name: AUTH_SERVICE_URL
+              value: "{{ include "notenest.fullname" . }}-auth:50051"
+            - name: USER_SERVICE_URL
+              value: "{{ include "notenest.fullname" . }}-user:50052"
+            - name: NOTE_SERVICE_URL
+              value: "localhost:50053"
+            - name: ATTACHMENT_SERVICE_URL
+              value: "localhost:50054"
+            - name: KAFKA_BROKERS
+              value: "kafka:9092"
+            - name: RABBITMQ_URL
+              value: "amqp://guest:guest@rabbitmq:5672/"
+            - name: CONSUL_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "notenest.fullname" . }}-config
+                  key: CONSUL_HOST
+            - name: CONSUL_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "notenest.fullname" . }}-config
+                  key: CONSUL_PORT
+          livenessProbe:
+            tcpSocket:
+              port: {{ .Values.note.httpPort }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.note.httpPort }}
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.note.resources | nindent 12 }}

@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package notenest.user;
+
+// Service defining user profile methods
+service UserService {
+  rpc GetUserProfile (GetUserProfileRequest) returns (UserProfileResponse);
+  rpc GetUsersByIDs (GetUsersByIDsRequest) returns (UsersBatchResponse);
+}
+
+message GetUserProfileRequest {
+  string user_id = 1;
+}
+
+message UserProfileResponse {
+  string user_id = 1;
+  string email = 2;
+  string created_at = 3;
+}
+
+message GetUsersByIDsRequest {
+  repeated string user_ids = 1;
+}
+
+message UsersBatchResponse {
+  repeated UserProfileResponse users = 1;
+}

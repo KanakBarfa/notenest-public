@@ -1,0 +1,268 @@
+import json
+import os
+import sys
+import time
+import threading
+import base64
+from confluent_kafka import Consumer, Producer, KafkaError
+import grpc
+import pika
+import redis
+
+import signal
+from consul_client import ConsulClient
+from obs_helper import setup_json_logger, init_metrics_server, HTTP_REQUESTS_TOTAL, HTTP_REQUEST_DURATION, KAFKA_CONSUMER_LAG, parse_traceparent, generate_span_id, send_otlp_span, format_traceparent
+
+import note_pb2
+import note_pb2_grpc
+
+KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "kafka:9092")
+NOTE_SERVICE_URL = os.getenv("NOTE_SERVICE_URL", "app:50054")
+REDIS_HOST = os.getenv("REDIS_HOST", "redis")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@rabbitmq:5672/")
+
+logger = setup_json_logger("notification-service")
+
+def run_kafka_consumer():
+    logger.info(f"Connecting to Redis at {REDIS_HOST}:{REDIS_PORT}...")
+    r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0)
+
+    logger.info(f"Connecting to gRPC Note/Attachment Service at {NOTE_SERVICE_URL} via Consul discovery...")
+    consul_client = ConsulClient()
+    grpc_target = consul_client.resolve_grpc_target("attachment-service", fallback_target=NOTE_SERVICE_URL)
+    logger.info(f"Resolved gRPC Target: {grpc_target}")
+    options = [("grpc.lb_policy_name", "round_robin")]
+    channel = grpc.insecure_channel(grpc_target, options=options)
+    stub = note_pb2_grpc.NotificationServiceStub(channel)
+
+    kafka_conf = {
+        "bootstrap.servers": KAFKA_BROKERS,
+        "group.id": "notification-group",
+        "auto.offset.reset": "earliest",
+        "enable.auto.commit": True,
+    }
+    
+    producer_conf = {"bootstrap.servers": KAFKA_BROKERS}
+    dlt_producer = None
+    try:
+        dlt_producer = Producer(producer_conf)
+    except Exception as e:
+        logger.warning(f"Warning initializing DLT producer: {e}")
+
+    consumer = None
+    for attempt in range(15):
+        try:
+            consumer = Consumer(kafka_conf)
+            consumer.subscribe(["note.events"])
+            logger.info("Subscribed to Kafka topic 'note.events'")
+            break
+        except Exception as e:
+            logger.warning(f"Waiting for Kafka ({attempt+1}/15): {e}")
+            time.sleep(2)
+
+    if not consumer:
+        logger.error("Fatal: Could not connect to Kafka.")
+        sys.exit(1)
+
+    while True:
+        try:
+            msg = consumer.poll(1.0)
+            if msg is None:
+                continue
+            if msg.error():
+                if msg.error().code() == KafkaError._PARTITION_EOF:
+                    continue
+                logger.error(f"Kafka error: {msg.error()}")
+                continue
+
+            raw_payload = msg.value().decode("utf-8")
+            
+            # Extract headers for tracing
+            headers_dict = dict(msg.headers()) if msg.headers() else {}
+            tp = headers_dict.get("traceparent")
+            if isinstance(tp, bytes):
+                tp = tp.decode("utf-8")
+            
+            trace_id, parent_id = parse_traceparent(tp)
+            span_id = generate_span_id()
+            start_time = time.time()
+            start_ns = int(start_time * 1e9)
+
+            logger.info(f"Received Kafka message: {raw_payload}", extra={"trace_id": trace_id, "span_id": span_id})
+            KAFKA_CONSUMER_LAG.labels(topic="note.events", group="notification-group").set(0)
+
+            try:
+                data = json.loads(raw_payload)
+                if not tp and "trace_id" in data:
+                    trace_id = data["trace_id"]
+            except Exception as parse_err:
+                logger.error(f"Malformed message, sending to DLT: {parse_err}", extra={"trace_id": trace_id})
+                if dlt_producer:
+                    dlt_producer.produce("note.events.DLT", value=raw_payload.encode("utf-8"))
+                    dlt_producer.flush()
+                continue
+
+            event_id = data.get("event_id") or (msg.key().decode("utf-8") if msg.key() else str(time.time()))
+            event_type = data.get("event_type", "note_updated")
+            target_user = data.get("shared_with_user_id") or data.get("owner_id", "")
+
+            # Idempotency check via Redis
+            redis_key = f"notif:processed:{event_id}"
+            is_new = r.set(redis_key, "1", nx=True, ex=86400)
+            if not is_new:
+                logger.info(f"Duplicate event {event_id} skipped.", extra={"trace_id": trace_id})
+                continue
+
+            # Deliver notification via gRPC to Note Service (C++ SSE EventBus)
+            req = note_pb2.NotifyRequest(
+                user_id=target_user,
+                event_type=event_type,
+                payload=raw_payload
+            )
+            try:
+                grpc_tp = format_traceparent(trace_id, span_id)
+                resp = stub.Notify(req, timeout=5, metadata=(("traceparent", grpc_tp), ("trace-id", trace_id)))
+                logger.info(f"Notification delivered to {target_user}: {resp.delivered}", extra={"trace_id": trace_id})
+                HTTP_REQUESTS_TOTAL.labels(service="notification-service", method="KafkaProcess", status="200").inc()
+            except Exception as grpc_err:
+                logger.error(f"gRPC Notify failed: {grpc_err}", extra={"trace_id": trace_id})
+                HTTP_REQUESTS_TOTAL.labels(service="notification-service", method="KafkaProcess", status="500").inc()
+
+            end_time = time.time()
+            end_ns = int(end_time * 1e9)
+            duration = end_time - start_time
+            HTTP_REQUEST_DURATION.labels(service="notification-service", method="KafkaProcess").observe(duration)
+            send_otlp_span("notification-service", "KafkaProcess", trace_id, span_id, parent_id, start_ns, end_ns)
+
+        except Exception as e:
+            logger.error(f"Exception in consumer loop: {e}")
+            time.sleep(1)
+
+
+def generate_pdf_bytes(title: str, content: str, user_id: str, note_id: str) -> bytes:
+    header = f"Note Title: {title or 'Untitled Note'}\nNote ID: {note_id}\nUser ID: {user_id}\n\nNote Content:\n{content or 'No content'}"
+    lines = header.split('\n')
+    stream_ops = []
+    for line in lines:
+        safe_line = line.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        stream_ops.append(f"({safe_line}) '")
+    
+    stream_data = "BT\n/F1 12 Tf\n50 740 Td\n14 TL\n" + "\n".join(stream_ops) + "\nET\n"
+    
+    pdf_str = (
+        f"%PDF-1.4\n"
+        f"1 0 obj <</Type /Catalog /Pages 2 0 R>> endobj\n"
+        f"2 0 obj <</Type /Pages /Kids [3 0 R] /Count 1>> endobj\n"
+        f"3 0 obj <</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources <</Font <</F1 5 0 R>>>> >> endobj\n"
+        f"4 0 obj <</Length {len(stream_data)}>> stream\n"
+        f"{stream_data}"
+        f"endstream\nendobj\n"
+        f"5 0 obj <</Type /Font /Subtype /Type1 /BaseFont /Helvetica>> endobj\n"
+        f"trailer <</Root 1 0 R>>\n%%EOF"
+    )
+    return pdf_str.encode('latin1')
+
+
+def run_rabbitmq_worker():
+    logger.info(f"Starting RabbitMQ worker connected to {RABBITMQ_URL}...")
+    params = None
+    if RABBITMQ_URL.startswith("amqp://"):
+        params = pika.URLParameters(RABBITMQ_URL)
+    else:
+        params = pika.ConnectionParameters(host=RABBITMQ_URL)
+
+    connection = None
+    for attempt in range(15):
+        try:
+            connection = pika.BlockingConnection(params)
+            break
+        except Exception as e:
+            logger.warning(f"Waiting for RabbitMQ ({attempt+1}/15): {e}")
+            time.sleep(2)
+
+    if not connection:
+        logger.warning("Could not connect to RabbitMQ.")
+        return
+
+    channel = connection.channel()
+    channel.queue_declare(queue="pdf.requests", durable=False)
+
+    def on_request(ch, method, props, body):
+        start_time = time.time()
+        start_ns = int(start_time * 1e9)
+        try:
+            payload = json.loads(body.decode("utf-8"))
+            tp = payload.get("traceparent")
+            trace_id, parent_id = parse_traceparent(tp)
+            span_id = generate_span_id()
+
+            logger.info(f"Received PDF export request: {payload}", extra={"trace_id": trace_id, "span_id": span_id})
+            note_id = payload.get("note_id", "")
+            title = payload.get("title", "")
+            content = payload.get("content", "")
+            user_id = payload.get("user_id", "")
+            correlation_id = props.correlation_id or payload.get("correlation_id", "")
+
+            pdf_bytes = generate_pdf_bytes(title, content, user_id, note_id)
+            pdf_b64 = base64.b64encode(pdf_bytes).decode('utf-8')
+
+            pdf_summary = f"PDF Summary for note '{title}' (ID: {note_id}) exported for user {user_id}."
+            resp_data = {
+                "status": "completed",
+                "pdf_summary": pdf_summary,
+                "pdf_base64": pdf_b64,
+                "correlation_id": correlation_id
+            }
+
+            reply_to = props.reply_to or "pdf.replies"
+            ch.basic_publish(
+                exchange="",
+                routing_key=reply_to,
+                properties=pika.BasicProperties(correlation_id=correlation_id),
+                body=json.dumps(resp_data)
+            )
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+            logger.info(f"Published PDF export response for correlation_id {correlation_id}", extra={"trace_id": trace_id})
+            HTTP_REQUESTS_TOTAL.labels(service="notification-service", method="RabbitMQExportPDF", status="200").inc()
+
+            end_time = time.time()
+            end_ns = int(end_time * 1e9)
+            duration = end_time - start_time
+            HTTP_REQUEST_DURATION.labels(service="notification-service", method="RabbitMQExportPDF").observe(duration)
+            send_otlp_span("notification-service", "RabbitMQExportPDF", trace_id, span_id, parent_id, start_ns, end_ns)
+
+        except Exception as err:
+            logger.error(f"Error handling PDF request: {err}")
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+
+    channel.basic_qos(prefetch_count=1)
+    channel.basic_consume(queue="pdf.requests", on_message_callback=on_request)
+    logger.info("RabbitMQ worker listening on queue 'pdf.requests'...")
+    try:
+        channel.start_consuming()
+    except Exception as e:
+        logger.warning(f"RabbitMQ worker stopped: {e}")
+
+
+if __name__ == "__main__":
+    init_metrics_server(9103)
+    consul = ConsulClient()
+    consul.register_service("notification-service", 50055)
+    consul.start_heartbeat(4)
+
+    def shutdown(signum, frame):
+        logger.info("Shutting down Notification Service...")
+        consul.deregister_all_services()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    try:
+        t_rabbit = threading.Thread(target=run_rabbitmq_worker, daemon=True)
+        t_rabbit.start()
+
+        run_kafka_consumer()
+    finally:
+        consul.deregister_all_services()

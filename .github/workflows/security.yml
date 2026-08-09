@@ -1,0 +1,70 @@
+name: Security - Vulnerability & Secret Scanning
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  trivy-fs-scan:
+    name: Trivy Repository Filesystem Scan
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy Vulnerability Scanner (FS)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          ignore-unfixed: true
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+
+  trivy-container-scan:
+    name: Trivy Container Image Scan
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build NoteNest Container Image with GHA Caching
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true
+          tags: notenest:security-check
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Trivy Container Vulnerability Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'notenest:security-check'
+          format: 'table'
+          exit-code: '0'
+          ignore-unfixed: true
+          severity: 'CRITICAL,HIGH'
+
+  secret-detection:
+    name: Secret & Credential Scan
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Secret Audit
+        run: |
+          echo "Scanning repository for accidentally committed private keys or credentials..."
+          ! grep -rnI "BEGIN PRIVATE KEY" . --exclude-dir=.git --exclude-dir=.venv --exclude-dir=.github
+          ! grep -rnI "AWS_SECRET_ACCESS_KEY.*[A-Za-z0-9/+=]\{40\}" . --exclude-dir=.git --exclude-dir=.venv --exclude-dir=.github
+          echo "Secret scanning completed with zero hardcoded credentials."

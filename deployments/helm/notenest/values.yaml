@@ -1,0 +1,137 @@
+global:
+  namespace: default
+  environment: production
+  # Set existingSecret if using an externally managed Kubernetes Secret
+  existingSecret: ""
+  # Sensitive secrets can be passed via --set or values-prod.yaml
+  jwtSecret: ""
+  db:
+    name: postgres
+    user: postgres
+    password: ""
+    host: pgbouncer
+    port: 6432
+    readHost: pgbouncer-read
+    readPort: 6433
+  redis:
+    host: redis
+    port: 6379
+  consul:
+    host: consul
+    port: 8500
+  minio:
+    endpoint: "http://minio:9000"
+    accessKey: ""
+    secretKey: ""
+    bucket: notenest-attachments
+    externalEndpoint: "http://localhost:8081"
+
+auth:
+  replicaCount: 1
+  image:
+    repository: notenest/auth
+    tag: latest
+    pullPolicy: IfNotPresent
+  port: 50051
+  metricsPort: 9101
+  resources:
+    limits:
+      cpu: 250m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+user:
+  replicaCount: 1
+  image:
+    repository: notenest/user
+    tag: latest
+    pullPolicy: IfNotPresent
+  port: 50052
+  metricsPort: 9102
+  resources:
+    limits:
+      cpu: 250m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+note:
+  replicaCount: 2
+  image:
+    repository: notenest/app
+    tag: latest
+    pullPolicy: IfNotPresent
+  httpPort: 8080
+  grpcNotePort: 50053
+  grpcAttachmentPort: 50054
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 80
+
+graphql:
+  replicaCount: 1
+  image:
+    repository: notenest/graphql
+    tag: latest
+    pullPolicy: IfNotPresent
+  port: 4000
+  resources:
+    limits:
+      cpu: 250m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+notification:
+  replicaCount: 1
+  image:
+    repository: notenest/notification
+    tag: latest
+    pullPolicy: IfNotPresent
+  metricsPort: 9103
+  resources:
+    limits:
+      cpu: 250m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+gateway:
+  replicaCount: 1
+  image:
+    repository: kong
+    tag: "3.5"
+    pullPolicy: IfNotPresent
+  proxyPort: 8000
+  resources:
+    limits:
+      cpu: 250m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+  hosts:
+    - host: notenest.local
+      paths:
+        - path: /
+          pathType: Prefix

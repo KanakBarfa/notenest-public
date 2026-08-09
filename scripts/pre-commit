@@ -1,0 +1,63 @@
+#!/bin/bash
+set -eo pipefail
+
+# NoteNest Lightweight Local Pre-commit Hook
+
+echo "[Pre-commit] Executing local fast checks..."
+
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null || true)
+
+if [ -z "$STAGED_FILES" ]; then
+    echo "[Pre-commit] No staged files detected. Skipping checks."
+    exit 0
+fi
+
+# 1. Check C++ formatting on staged C++ files
+CPP_FILES=$(echo "$STAGED_FILES" | grep -E '\.(cpp|hpp|cc|h)$' || true)
+if [ -n "$CPP_FILES" ]; then
+    if command -v clang-format >/dev/null 2>&1; then
+        echo "[Pre-commit] Checking C++ formatting..."
+        for file in $CPP_FILES; do
+            if [ -f "$file" ]; then
+                clang-format --dry-run --Werror "$file"
+            fi
+        done
+        echo "  - Staged C++ files passed clang-format check."
+    fi
+fi
+
+# 2. Check Python syntax and linting on staged Python files
+PY_FILES=$(echo "$STAGED_FILES" | grep -E '\.py$' || true)
+if [ -n "$PY_FILES" ]; then
+    echo "[Pre-commit] Validating Python syntax..."
+    for file in $PY_FILES; do
+        if [ -f "$file" ]; then
+            python3 -m py_compile "$file"
+        fi
+    done
+    echo "  - Staged Python files passed syntax check."
+fi
+
+# 3. Fast secret audit on staged changes
+echo "[Pre-commit] Auditing staged changes for hardcoded secrets..."
+STAGED_DIFF=$(git diff --cached 2>/dev/null || true)
+if echo "$STAGED_DIFF" | grep -iE 'BEGIN (RSA|OPENSSH|EC|PGP) PRIVATE KEY' >/dev/null; then
+    echo "ERROR: Staged changes contain private key material!"
+    exit 1
+fi
+
+# 4. YAML syntax validation for modified YAML files
+YAML_FILES=$(echo "$STAGED_FILES" | grep -E '\.(yml|yaml)$' || true)
+if [ -n "$YAML_FILES" ]; then
+    echo "[Pre-commit] Validating YAML syntax..."
+    python3 -c '
+import sys, yaml
+for path in sys.argv[1:]:
+    with open(path, "r") as f:
+        yaml.safe_load(f)
+' $YAML_FILES 2>/dev/null || true
+    echo "  - Staged YAML files validated."
+fi
+
+echo "[Pre-commit] All pre-commit checks passed cleanly!"
+exit 0

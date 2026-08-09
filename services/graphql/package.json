@@ -1,0 +1,21 @@
+{
+  "name": "notenest-graphql",
+  "version": "0.19.0",
+  "description": "NoteNest GraphQL Service with DataLoader Batching & Prometheus Metrics",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@apollo/server": "^4.10.0",
+    "cors": "^2.8.5",
+    "dataloader": "^2.2.2",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "graphql": "^16.8.1",
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.11.3",
+    "prom-client": "^15.1.0"
+  }
+}

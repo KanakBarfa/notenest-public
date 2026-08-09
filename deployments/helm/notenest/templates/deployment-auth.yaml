@@ -1,0 +1,90 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "notenest.fullname" . }}-auth
+  labels:
+    app.kubernetes.io/component: auth-service
+    {{- include "notenest.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.auth.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: auth-service
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: auth-service
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      containers:
+        - name: auth-service
+          image: "{{ .Values.auth.image.repository }}:{{ .Values.auth.image.tag }}"
+          imagePullPolicy: {{ .Values.auth.image.pullPolicy }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.auth.port }}
+            - name: metrics
+              containerPort: {{ .Values.auth.metricsPort }}
+          env:
+            - name: DATABASE_URL
+              value: "host=$(DB_HOST) port=$(DB_PORT) dbname=$(DB_NAME) user=$(DB_USER) password=$(DB_PASSWORD)"
+            - name: DB_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "notenest.fullname" . }}-config
+                  key: DB_HOST
+            - name: DB_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "notenest.fullname" . }}-config
+                  key: DB_PORT
+            - name: DB_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "notenest.fullname" . }}-config
+                  key: DB_NAME
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "notenest.secretName" . }}
+                  key: DB_USER
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "notenest.secretName" . }}
+                  key: DB_PASSWORD
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "notenest.secretName" . }}
+                  key: JWT_SECRET
+            - name: PORT
+              value: {{ .Values.auth.port | quote }}
+            - name: CONSUL_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "notenest.fullname" . }}-config
+                  key: CONSUL_HOST
+            - name: CONSUL_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "notenest.fullname" . }}-config
+                  key: CONSUL_PORT
+          livenessProbe:
+            tcpSocket:
+              port: {{ .Values.auth.port }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.auth.port }}
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.auth.resources | nindent 12 }}
