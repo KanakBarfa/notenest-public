@@ -9,7 +9,6 @@ services:
       POSTGRES_PASSWORD: ${DB_PASSWORD:-pass}
     volumes:
       - pg_data:/var/lib/postgresql/data
-      - ./db/migrations:/docker-entrypoint-initdb.d:ro
     networks:
       - data_net
     healthcheck:

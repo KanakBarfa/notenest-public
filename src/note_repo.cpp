@@ -1,6 +1,7 @@
 #include <notenest/db_pool.hpp>
 #include <notenest/note_repo.hpp>
 #include <print>
+#include <unordered_map>
 
 std::vector<Note> PgNoteRepository::getAllNotes(const std::string& owner_id) {
     DBConnectionGuard guard(DBPoolMode::READ);
@@ -39,8 +40,50 @@ std::vector<Note> PgNoteRepository::getAllNotes(const std::string& owner_id) {
     }
     PQclear(res);
 
-    for (auto& note : notes) {
-        note.attachments = getAttachmentsForNote(note.id);
+    // Single batched fetch; one round-trip instead of one per note.
+    if (!notes.empty()) {
+        std::string id_list = "{";
+        for (size_t i = 0; i < notes.size(); ++i) {
+            if (i > 0)
+                id_list += ",";
+            id_list += "\"" + notes[i].id + "\"";
+        }
+        id_list += "}";
+
+        const char* att_query =
+            "SELECT note_id::text, id::text, bucket, key, size, filename FROM attachments "
+            "WHERE note_id = ANY($1::uuid[]) ORDER BY created_at ASC";
+        const char* att_params[1] = {id_list.c_str()};
+        PGresult* att_res =
+            PQexecParams(conn, att_query, 1, nullptr, att_params, nullptr, nullptr, 0);
+        if (PQresultStatus(att_res) == PGRES_TUPLES_OK) {
+            std::unordered_map<std::string, std::vector<Attachment>> by_note;
+            for (int i = 0; i < PQntuples(att_res); ++i) {
+                Attachment att;
+                std::string note_id = PQgetvalue(att_res, i, 0);
+                att.id = PQgetvalue(att_res, i, 1);
+                att.note_id = note_id;
+                att.bucket = PQgetvalue(att_res, i, 2);
+                att.key = PQgetvalue(att_res, i, 3);
+                try {
+                    att.size = std::stoll(PQgetvalue(att_res, i, 4));
+                } catch (...) {
+                    att.size = 0;
+                }
+                att.filename = PQgetvalue(att_res, i, 5);
+                att.url = "";  // Populated dynamically by the Store layer
+                by_note[note_id].push_back(std::move(att));
+            }
+            for (auto& note : notes) {
+                auto it = by_note.find(note.id);
+                if (it != by_note.end()) {
+                    note.attachments = std::move(it->second);
+                }
+            }
+        } else {
+            std::println(stderr, "DB Error fetching attachments: {}", PQerrorMessage(conn));
+        }
+        PQclear(att_res);
     }
     return notes;
 }

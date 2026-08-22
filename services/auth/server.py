@@ -214,7 +214,9 @@ class AuthServiceServicer(auth_pb2_grpc.AuthServiceServicer):
 
         conn = None
         try:
-            conn = get_db_connection("read")
+            # Primary only: a replica could lag behind the signup write and
+            # reject the user's very first login (read-your-writes).
+            conn = get_db_connection("write")
             with conn.cursor() as cur:
                 cur.execute("SELECT id, email, password_hash FROM users WHERE email = %s", (email,))
                 row = cur.fetchone()

@@ -1,10 +1,9 @@
 #!/bin/bash
-set -eo pipefail
+set -euo pipefail
 
-# Run pending database schema migrations before starting the C++ application server
+# Fail-fast: the app must not serve traffic on an unmigrated schema.
 if [ -d "./db" ]; then
-    ./db/migrate.sh || echo "Notice: Migration runner finished or skipped."
+    ./db/migrate.sh
 fi
 
-# Execute the primary application process
 exec ./notenest

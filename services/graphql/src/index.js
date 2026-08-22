@@ -139,14 +139,43 @@ class CircuitBreaker {
 
 const dbCircuitBreaker = new CircuitBreaker(5, 5000);
 
+// Sticky read-your-writes: after a user mutates, their reads bypass the
+// replica for a short window so fresh writes are immediately visible.
+const READ_YOUR_WRITES_WINDOW_MS = 3000;
+const recentMutations = new Map();
+
+const markMutation = (userId) => {
+  if (!userId) return;
+  const now = Date.now();
+  if (recentMutations.size > 10000) {
+    for (const [id, until] of recentMutations) {
+      if (until < now) recentMutations.delete(id);
+    }
+  }
+  recentMutations.set(userId, now + READ_YOUR_WRITES_WINDOW_MS);
+};
+
+const hasStickyWrite = (userId) => {
+  if (!userId) return false;
+  const until = recentMutations.get(userId);
+  if (!until) return false;
+  if (Date.now() > until) {
+    recentMutations.delete(userId);
+    return false;
+  }
+  return true;
+};
+
 // Safe database query wrapper with Circuit Breaker, Read/Write splitting, and pool logging
-const queryDB = async (text, params, isRead = true) => {
+// When userId is given and recently mutated, reads are served by the primary
+// so the user sees their own writes despite replica lag.
+const queryDB = async (text, params, isRead = true, userId = null) => {
   if (!dbCircuitBreaker.allowRequest()) {
     logJson('ERROR', 'Circuit Breaker is OPEN. Fast failing query.');
     throw new Error('Circuit Breaker OPEN - Database service unavailable');
   }
 
-  if (isRead) {
+  if (isRead && !hasStickyWrite(userId)) {
     try {
       const res = await dbReadPool.query(text, params);
       dbCircuitBreaker.recordSuccess();
@@ -180,7 +209,9 @@ const getNoteAccess = async (userId, noteId) => {
      FROM notes n
      LEFT JOIN note_shares s ON s.note_id = n.id AND s.shared_with_user_id = $2::uuid
      WHERE n.id = $1::uuid`,
-    [noteId, userId]
+    [noteId, userId],
+    true,
+    userId
   );
   return rows.length > 0 && rows[0].permission ? rows[0].permission : null;
 };
@@ -205,13 +236,15 @@ const assertNoteAccess = async (userId, noteId, requiredPermission = 'viewer') =
 };
 
 // DataLoaders batching logic to prevent N+1 query problem
-const createLoaders = () => ({
+const createLoaders = (userId) => ({
   userLoader: new DataLoader(async (userIds) => {
     const uniqueIds = [...new Set(userIds)];
     logJson('INFO', `[DataLoader] Batching ${userIds.length} user ID lookups (${uniqueIds.length} unique) into 1 query`);
     const { rows } = await queryDB(
       'SELECT id::text, email FROM users WHERE id = ANY($1::uuid[])',
-      [uniqueIds]
+      [uniqueIds],
+      true,
+      userId
     );
     const userMap = new Map(rows.map((u) => [u.id, u]));
     return userIds.map((id) => userMap.get(id) || null);
@@ -226,7 +259,9 @@ const createLoaders = () => ({
        FROM comments
        WHERE note_id = ANY($1::uuid[])
        ORDER BY created_at ASC`,
-      [uniqueIds]
+      [uniqueIds],
+      true,
+      userId
     );
     const commentsMap = new Map();
     uniqueIds.forEach((id) => commentsMap.set(id, []));
@@ -267,7 +302,7 @@ const typeDefs = `#graphql
 
   type Query {
     note(id: ID!): Note
-    notes: [Note!]!
+    notes(limit: Int, cursor: String): [Note!]!
     user(id: ID!): User
     comments(noteId: ID!): [Comment!]!
     me: User
@@ -288,27 +323,41 @@ const resolvers = {
         `SELECT id::text, title, content, owner_id::text,
                 to_char(created_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as created_at
          FROM notes WHERE id = $1::uuid`,
-        [id]
+        [id],
+        true,
+        context.user && context.user.id
       );
       if (rows.length === 0) return null;
       return { ...rows[0], permission };
     },
 
-    notes: async (_, __, context) => {
+    notes: async (_, { limit, cursor }, context) => {
       if (!context.user) {
         throw new GraphQLError('Unauthorized', { extensions: { code: 'UNAUTHENTICATED' } });
       }
-      const query = `
+      const cappedLimit = Math.min(Math.max(limit || 0, 0), 100);
+      let query = `
         SELECT n.id::text, n.title, n.content, n.owner_id::text,
-               to_char(n.created_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as created_at,
+               to_char(n.created_at, 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as created_at,
                CASE WHEN n.owner_id = $1::uuid THEN 'owner' ELSE COALESCE(s.permission, 'editor') END AS permission
         FROM notes n
         LEFT JOIN note_shares s ON n.id = s.note_id AND s.shared_with_user_id = $1::uuid
-        WHERE n.owner_id = $1::uuid OR s.shared_with_user_id = $1::uuid
-        ORDER BY n.id ASC
-      `;
+        WHERE (n.owner_id = $1::uuid OR s.shared_with_user_id = $1::uuid)`;
       const params = [context.user.id];
-      const { rows } = await queryDB(query, params);
+      if (cursor) {
+        const sep = cursor.lastIndexOf('|');
+        if (sep === -1) {
+          throw new GraphQLError('Invalid cursor', { extensions: { code: 'BAD_USER_INPUT' } });
+        }
+        params.push(cursor.slice(0, sep), cursor.slice(sep + 1));
+        query += ` AND (n.created_at, n.id) < ($${params.length - 1}::timestamptz, $${params.length}::uuid)`;
+      }
+      query += ' ORDER BY n.created_at DESC, n.id DESC';
+      if (cappedLimit > 0) {
+        params.push(cappedLimit);
+        query += ` LIMIT $${params.length}`;
+      }
+      const { rows } = await queryDB(query, params, true, context.user.id);
       return rows;
     },
 
@@ -340,6 +389,7 @@ const resolvers = {
         [title, content, context.user.id],
         false
       );
+      markMutation(context.user.id);
       return rows[0];
     },
 
@@ -356,6 +406,7 @@ const resolvers = {
         [noteId, context.user.id, content],
         false
       );
+      markMutation(context.user.id);
       return rows[0];
     },
 
@@ -374,6 +425,7 @@ const resolvers = {
         [id, context.user.id],
         false
       );
+      if (rowCount > 0) markMutation(context.user.id);
       return rowCount > 0;
     },
   },
@@ -499,7 +551,7 @@ async function startServer() {
 
         return {
           user,
-          loaders: createLoaders(),
+          loaders: createLoaders(user && user.id),
           traceId: req.traceId,
           spanId: req.spanId,
         };
