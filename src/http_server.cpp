@@ -163,7 +163,7 @@ void HttpServer::start() {
     int opt = 1;
     setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    struct sockaddr_in address{};
+    struct sockaddr_in address {};
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(port_);
@@ -222,7 +222,7 @@ void HttpServer::runAcceptor() {
                     c.last_activity = now();
                     c.next_keep_alive = now() + std::chrono::seconds(kSseKeepAliveSecs);
                     w.conns.emplace(cfd, std::move(c));
-                    struct epoll_event ev{};
+                    struct epoll_event ev {};
                     ev.events = EPOLLIN;
                     ev.data.fd = cfd;
                     if (epoll_ctl(w.epoll_fd, EPOLL_CTL_ADD, cfd, &ev) < 0) {
@@ -252,7 +252,7 @@ void HttpServer::initWorker(Worker& w) {
     ts.it_interval.tv_sec = kTimerIntervalMs / 1000;
     timerfd_settime(w.timer_fd, 0, &ts, nullptr);
 
-    struct epoll_event ev{};
+    struct epoll_event ev {};
     ev.events = EPOLLIN;
     ev.data.fd = w.wake_efd;
     epoll_ctl(w.epoll_fd, EPOLL_CTL_ADD, w.wake_efd, &ev);
@@ -373,7 +373,7 @@ void HttpServer::onTimerTick(Worker& w) {
 void HttpServer::armOut(Worker& w, Connection& c, bool armed) {
     if (c.out_armed == armed)
         return;
-    struct epoll_event ev{};
+    struct epoll_event ev {};
     ev.events = armed ? (EPOLLIN | EPOLLOUT) : EPOLLIN;
     ev.data.fd = c.fd;
     if (epoll_ctl(w.epoll_fd, EPOLL_CTL_MOD, c.fd, &ev) == 0) {
