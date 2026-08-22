@@ -355,6 +355,12 @@ void HttpServer::onTimerTick(Worker& w) {
             continue;
         }
         if (!c.is_sse && !c.is_websocket && !c.busy &&
+            c.request_deadline != std::chrono::steady_clock::time_point{} &&
+            tnow >= c.request_deadline) {
+            to_close.push_back(fd);  // stalled/partial request: slowloris guard
+            continue;
+        }
+        if (!c.is_sse && !c.is_websocket && !c.busy &&
             elapsedSecs(c.last_activity) >= kIdleTimeoutSecs) {
             to_close.push_back(fd);
         }
@@ -506,12 +512,35 @@ void HttpServer::handleWritable(Worker& w, int fd) {
     }
 }
 
-void HttpServer::dispatchRequest([[maybe_unused]] Worker& w, Connection& c) {
+void HttpServer::dispatchRequest(Worker& w, Connection& c) {
     // Parse as many pipelined requests as available.
     while (!c.busy && !c.close_after_flush) {
         HttpRequest req;
         size_t consumed = 0;
-        if (!HttpParser::parse(c.read_buf, req, consumed)) {
+        auto result = HttpParser::parse(c.read_buf, req, consumed);
+        if (result == HttpParser::Result::Incomplete) {
+            auto zero = std::chrono::steady_clock::time_point{};
+            if (!c.read_buf.empty() && c.request_deadline == zero) {
+                c.request_deadline = now() + std::chrono::seconds(kRequestTimeoutSecs);
+            }
+            return;
+        }
+        c.request_deadline = {};
+        if (result == HttpParser::Result::Error) {
+            c.read_buf.clear();
+            HttpResponse bad;
+            bad.status_code = 400;
+            bad.status_text = "Bad Request";
+            bad.body = "{\"error\":\"malformed_request\"}";
+            bad.headers["Content-Type"] = "application/json";
+            bad.keep_alive = false;
+            c.out_buf.append(bad.toString());
+            c.close_after_flush = true;
+            if (!flushOut(w, c)) {
+                closeConn(w, c.fd);
+            } else if (c.out_off >= c.out_buf.size()) {
+                closeConn(w, c.fd);
+            }
             return;
         }
         c.read_buf.erase(0, consumed);
@@ -535,14 +564,24 @@ void HttpServer::completeResponse(Worker& w, int fd, uint64_t gen, HttpRequest r
     Connection& c = it->second;
     c.busy = false;
 
+    bool upgraded = res.is_sse || res.is_websocket;
+    if (!upgraded) {
+        res.keep_alive = req.keep_alive;
+    }
+
+    // Internal routing headers must never reach the wire.
+    std::string ws_note = res.headers.count("X-Note-Id") ? res.headers["X-Note-Id"] : "";
+    std::string ws_email = res.headers.count("X-User-Email") ? res.headers["X-User-Email"] : "";
+    bool ws_editor = res.headers.count("X-Note-Editor") && res.headers["X-Note-Editor"] == "1";
+    std::erase_if(res.headers, [](const auto& kv) { return kv.first.rfind("X-", 0) == 0; });
+
     std::string payload = res.toString();
-    bool keep_open = res.is_sse || res.is_websocket;
-    if (keep_open) {
+    if (upgraded) {
         c.is_sse = res.is_sse;
         c.is_websocket = res.is_websocket;
         c.next_keep_alive = now() + std::chrono::seconds(kSseKeepAliveSecs);
     } else {
-        c.close_after_flush = true;
+        c.close_after_flush = !req.keep_alive;
     }
     c.out_buf.append(payload);
 
@@ -556,14 +595,11 @@ void HttpServer::completeResponse(Worker& w, int fd, uint64_t gen, HttpRequest r
     }
 
     if (res.is_websocket && room_registry_) {
-        std::string note_id_str = res.headers["X-Note-Id"];
-        std::string user_email = res.headers["X-User-Email"];
-        bool is_editor = res.headers.count("X-Note-Editor") && res.headers["X-Note-Editor"] == "1";
-        if (!note_id_str.empty()) {
+        if (!ws_note.empty()) {
             std::string msg;
             std::vector<ConnId> targets;
-            room_registry_->joinRoom(note_id_str, ConnId{fd, gen}, req.user_id, user_email,
-                                     is_editor, msg, targets);
+            room_registry_->joinRoom(ws_note, ConnId{fd, gen}, req.user_id, ws_email, ws_editor,
+                                     msg, targets);
             if (!msg.empty() && !targets.empty()) {
                 std::string frame = WebSocket::encodeFrame(msg, 0x01);
                 for (ConnId t : targets) {

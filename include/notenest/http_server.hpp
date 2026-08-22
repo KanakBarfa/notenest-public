@@ -31,6 +31,8 @@ struct Connection {
     bool out_armed = false;  // EPOLLOUT currently registered
     std::chrono::steady_clock::time_point last_activity{};
     std::chrono::steady_clock::time_point next_keep_alive{};
+    // Deadline for receiving a complete request; zero = not armed.
+    std::chrono::steady_clock::time_point request_deadline{};
 };
 
 // Acceptor + N epoll workers; cross-thread posts via generation-checked queues.
@@ -52,6 +54,7 @@ private:
     static constexpr int kTimerIntervalMs = 5000;
     static constexpr int kSseKeepAliveSecs = 15;
     static constexpr int kIdleTimeoutSecs = 180;
+    static constexpr int kRequestTimeoutSecs = 20;
 
     struct Worker {
         unsigned idx = 0;

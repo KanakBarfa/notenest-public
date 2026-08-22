@@ -47,6 +47,7 @@ struct HttpRequest {
     std::unordered_map<std::string, std::string> headers;
     std::string body;
     std::string user_id;
+    bool keep_alive = true;  // computed by the parser from version + Connection
 };
 
 // Represents HTTP response details.
@@ -57,6 +58,7 @@ struct HttpResponse {
     std::string body;
     bool is_sse = false;
     bool is_websocket = false;
+    bool keep_alive = true;
 
     // Serializes the response to a raw HTTP response string.
     std::string toString() const {
@@ -72,6 +74,9 @@ struct HttpResponse {
         } else if (is_websocket) {
             // WebSockets upgrade header handles framing without Content-Length
         } else {
+            res += "Connection: ";
+            res += keep_alive ? "keep-alive" : "close";
+            res += "\r\n";
             res += "Content-Length: " + std::to_string(body.size()) + "\r\n";
         }
         res += "\r\n";
