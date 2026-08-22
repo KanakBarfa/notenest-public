@@ -111,9 +111,8 @@ std::string RabbitMQClient::requestPdfExport(const std::string& note_id, const s
     amqp_queue_declare(conn, 1, amqp_cstring_bytes("pdf.requests.DLQ"), 0, 1, 0, 0,
                        amqp_empty_table);
     amqp_get_rpc_reply(conn);
-    amqp_queue_bind(conn, 1, amqp_cstring_bytes("pdf.requests.DLQ"),
-                    amqp_cstring_bytes("pdf.dlx"), amqp_cstring_bytes("pdf.requests"),
-                    amqp_empty_table);
+    amqp_queue_bind(conn, 1, amqp_cstring_bytes("pdf.requests.DLQ"), amqp_cstring_bytes("pdf.dlx"),
+                    amqp_cstring_bytes("pdf.requests"), amqp_empty_table);
 
     amqp_bytes_t req_queue = amqp_cstring_bytes("pdf.requests");
     amqp_queue_declare(conn, 1, req_queue, 0, 1, 0, 0, queue_args);
@@ -129,8 +128,8 @@ std::string RabbitMQClient::requestPdfExport(const std::string& note_id, const s
     // Publish request persistently so it survives a broker restart.
     amqp_basic_properties_t props;
     memset(&props, 0, sizeof(props));
-    props._flags = AMQP_BASIC_CORRELATION_ID_FLAG | AMQP_BASIC_REPLY_TO_FLAG |
-                   AMQP_BASIC_DELIVERY_MODE_FLAG;
+    props._flags =
+        AMQP_BASIC_CORRELATION_ID_FLAG | AMQP_BASIC_REPLY_TO_FLAG | AMQP_BASIC_DELIVERY_MODE_FLAG;
     props.correlation_id = amqp_cstring_bytes(correlation_id.c_str());
     props.reply_to = reply_queue;
     props.delivery_mode = AMQP_DELIVERY_PERSISTENT;

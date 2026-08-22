@@ -6,7 +6,7 @@ set -euo pipefail
 # so concurrent runners (app container, k8s jobs, ops shells) serialize and
 # partially-applied migrations can never be recorded.
 
-DB_CONN=${DATABASE_URL:-"host=localhost port=5432 dbname=postgres user=postgres password=pass"}
+DB_CONN=${DATABASE_URL:-"host=${DB_HOST:-localhost} port=${DB_PORT:-5432} dbname=${DB_NAME:-postgres} user=${DB_USER:-postgres} password=${DB_PASSWORD:-pass}"}
 
 if [[ "$DB_CONN" == host=* ]]; then
     # libpq key=value string: pass straight through to psql.

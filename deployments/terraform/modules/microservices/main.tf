@@ -11,11 +11,6 @@ terraform {
   }
 }
 
-resource "random_password" "jwt_secret" {
-  length  = 64
-  special = false
-}
-
 resource "docker_image" "auth" {
   name         = "notenest-auth:latest"
   keep_locally = true
@@ -42,7 +37,7 @@ resource "docker_container" "auth" {
     "DB_NAME=postgres",
     "DB_USER=postgres",
     "DB_PASSWORD=pass",
-    "JWT_SECRET=${random_password.jwt_secret.result}",
+    "JWT_SECRET=${var.jwt_secret}",
     "CONSUL_HOST=${var.consul_container_name}",
     "CONSUL_PORT=8500"
   ]
@@ -117,7 +112,7 @@ resource "docker_container" "graphql" {
     "DB_NAME=postgres",
     "DB_USER=postgres",
     "DB_PASSWORD=pass",
-    "JWT_SECRET=${random_password.jwt_secret.result}",
+    "JWT_SECRET=${var.jwt_secret}",
     "CONSUL_HOST=${var.consul_container_name}",
     "CONSUL_PORT=8500"
   ]

@@ -128,8 +128,14 @@ module "consul" {
   host_port         = local.is_test ? 0 : 8500
 }
 
+resource "random_password" "jwt_secret" {
+  length  = 64
+  special = false
+}
+
 module "microservices" {
   source                  = "./modules/microservices"
+  jwt_secret              = random_password.jwt_secret.result
   prefix                  = local.prefix
   network_name            = docker_network.tf_network.name
   app_network_name        = docker_network.app_net.name
@@ -154,6 +160,7 @@ module "auxiliary" {
 
 module "app" {
   source                  = "./modules/app"
+  jwt_secret              = random_password.jwt_secret.result
   container_name          = local.is_test ? "${local.prefix}-app" : "notenest-app-container"
   nginx_container_name    = local.is_test ? "${local.prefix}-nginx" : "notenest-nginx-container"
   network_name            = docker_network.tf_network.name

@@ -261,7 +261,9 @@ class AuthServiceServicer(auth_pb2_grpc.AuthServiceServicer):
             return auth_pb2.AuthResponse()
         finally:
             if conn:
-                put_db_connection("read", conn)
+                # Login reads from the primary (read-your-writes), so the
+                # connection must go back to the WRITE pool it came from.
+                put_db_connection("write", conn)
 
     def VerifyToken(self, request, context):
         token = request.token.strip()

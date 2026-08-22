@@ -94,8 +94,9 @@ void OutboxRelay::run() {
                     continue;
                 }
                 for (int i = 0; i < PQntuples(res); ++i) {
-                    batch.emplace_back(PQgetvalue(res, i, 0),
-                                       std::make_pair(PQgetvalue(res, i, 1), PQgetvalue(res, i, 2)));
+                    batch.emplace_back(
+                        PQgetvalue(res, i, 0),
+                        std::make_pair(PQgetvalue(res, i, 1), PQgetvalue(res, i, 2)));
                 }
                 PQclear(res);
             }
@@ -126,7 +127,8 @@ void OutboxRelay::run() {
                 if (!confirmed.empty()) {
                     std::string ids = "{";
                     for (size_t i = 0; i < confirmed.size(); ++i) {
-                        if (i > 0) ids += ",";
+                        if (i > 0)
+                            ids += ",";
                         ids += "\"" + confirmed[i] + "\"";
                     }
                     ids += "}";

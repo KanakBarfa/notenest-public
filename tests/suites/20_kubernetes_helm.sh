@@ -8,7 +8,7 @@ echo "[Phase 20] Testing Kubernetes & Helm Deployment (v0.20)..."
 
 echo "1. Validating Helm chart templates and syntax..."
 helm lint "$SCRIPT_DIR/../../deployments/helm/notenest"
-helm template notenest-test "$SCRIPT_DIR/../../deployments/helm/notenest" > /dev/null
+helm template notenest-test "$SCRIPT_DIR/../../deployments/helm/notenest" --set global.jwtSecret="$(openssl rand -hex 64)" > /dev/null
 echo "  - Helm chart linting and template rendering verified"
 
 echo "2. Verifying Minikube cluster status..."
