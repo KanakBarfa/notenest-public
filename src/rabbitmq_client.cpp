@@ -4,6 +4,7 @@
 #include <amqp_framing.h>
 #include <amqp_tcp_socket.h>
 
+#include <cstring>
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <notenest/utils.hpp>
@@ -92,22 +93,47 @@ std::string RabbitMQClient::requestPdfExport(const std::string& note_id, const s
     amqp_channel_open(conn, 1);
     amqp_get_rpc_reply(conn);
 
-    // Declare pdf.requests queue
-    amqp_bytes_t req_queue = amqp_cstring_bytes("pdf.requests");
-    amqp_queue_declare(conn, 1, req_queue, 0, 0, 0, 0, amqp_empty_table);
+    // Mirror the Python worker topology: durable queues + dead-letter exchange.
+    // Mismatched re-declaration is rejected by the broker (406).
+    amqp_exchange_declare(conn, 1, amqp_cstring_bytes("pdf.dlx"), amqp_cstring_bytes("direct"), 0,
+                          1, 0, 0, amqp_empty_table);
+    amqp_get_rpc_reply(conn);
 
-    // Declare pdf.replies queue
+    amqp_table_entry_t dlx_args[2];
+    dlx_args[0].key = amqp_cstring_bytes("x-dead-letter-exchange");
+    dlx_args[0].value.kind = AMQP_FIELD_KIND_UTF8;
+    dlx_args[0].value.value.bytes = amqp_cstring_bytes("pdf.dlx");
+    dlx_args[1].key = amqp_cstring_bytes("x-dead-letter-routing-key");
+    dlx_args[1].value.kind = AMQP_FIELD_KIND_UTF8;
+    dlx_args[1].value.value.bytes = amqp_cstring_bytes("pdf.requests");
+    amqp_table_t queue_args = {.num_entries = 2, .entries = dlx_args};
+
+    amqp_queue_declare(conn, 1, amqp_cstring_bytes("pdf.requests.DLQ"), 0, 1, 0, 0,
+                       amqp_empty_table);
+    amqp_get_rpc_reply(conn);
+    amqp_queue_bind(conn, 1, amqp_cstring_bytes("pdf.requests.DLQ"),
+                    amqp_cstring_bytes("pdf.dlx"), amqp_cstring_bytes("pdf.requests"),
+                    amqp_empty_table);
+
+    amqp_bytes_t req_queue = amqp_cstring_bytes("pdf.requests");
+    amqp_queue_declare(conn, 1, req_queue, 0, 1, 0, 0, queue_args);
+    amqp_get_rpc_reply(conn);
+
     amqp_bytes_t reply_queue = amqp_cstring_bytes("pdf.replies");
-    amqp_queue_declare(conn, 1, reply_queue, 0, 0, 0, 0, amqp_empty_table);
+    amqp_queue_declare(conn, 1, reply_queue, 0, 1, 0, 0, amqp_empty_table);
+    amqp_get_rpc_reply(conn);
 
     // Consume from reply_queue
     amqp_basic_consume(conn, 1, reply_queue, amqp_empty_bytes, 0, 1, 0, amqp_empty_table);
 
-    // Publish request
+    // Publish request persistently so it survives a broker restart.
     amqp_basic_properties_t props;
-    props._flags = AMQP_BASIC_CORRELATION_ID_FLAG | AMQP_BASIC_REPLY_TO_FLAG;
+    memset(&props, 0, sizeof(props));
+    props._flags = AMQP_BASIC_CORRELATION_ID_FLAG | AMQP_BASIC_REPLY_TO_FLAG |
+                   AMQP_BASIC_DELIVERY_MODE_FLAG;
     props.correlation_id = amqp_cstring_bytes(correlation_id.c_str());
     props.reply_to = reply_queue;
+    props.delivery_mode = AMQP_DELIVERY_PERSISTENT;
 
     amqp_bytes_t message_bytes;
     message_bytes.len = req_str.size();

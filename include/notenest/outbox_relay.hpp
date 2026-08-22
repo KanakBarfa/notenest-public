@@ -24,6 +24,9 @@ public:
 private:
     void run();
 
+    static constexpr int kRetentionDays = 7;
+    static constexpr int kRetentionEveryLoops = 7200;  // ~hourly at 500ms cadence
+
     DBPool& db_pool_;
     KafkaProducer& kafka_producer_;
     std::atomic<bool> running_{false};
