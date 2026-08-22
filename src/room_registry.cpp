@@ -3,9 +3,10 @@
 
 Room::Room(std::string note_id) : note_id_(std::move(note_id)) {}
 
-void Room::join(int fd, const std::string& user_id, const std::string& email) {
+void Room::join(const ConnId& id, const std::string& user_id, const std::string& email,
+                bool editor) {
     std::lock_guard<std::mutex> lock(mutex_);
-    participants_[fd] = Participant{fd, user_id, email};
+    participants_[id.fd] = Participant{id, user_id, email, editor};
 }
 
 bool Room::leave(int fd, std::string& out_user_id) {
@@ -33,15 +34,15 @@ std::vector<Participant> Room::getParticipants() const {
     return list;
 }
 
-std::vector<int> Room::getTargetFds(int exclude_fd) const {
+std::vector<ConnId> Room::getTargets(int exclude_fd) const {
     std::lock_guard<std::mutex> lock(mutex_);
-    std::vector<int> fds;
+    std::vector<ConnId> ids;
     for (const auto& [fd, p] : participants_) {
         if (fd != exclude_fd) {
-            fds.push_back(fd);
+            ids.push_back(p.id);
         }
     }
-    return fds;
+    return ids;
 }
 
 Participant Room::getParticipant(int fd) const {
@@ -50,20 +51,20 @@ Participant Room::getParticipant(int fd) const {
     if (it != participants_.end()) {
         return it->second;
     }
-    return Participant{-1, "", ""};
+    return Participant{};
 }
 
-bool RoomRegistry::joinRoom(const std::string& note_id, int fd, const std::string& user_id,
-                            const std::string& email, std::string& out_broadcast_msg,
-                            std::vector<int>& out_target_fds) {
+bool RoomRegistry::joinRoom(const std::string& note_id, ConnId id, const std::string& user_id,
+                            const std::string& email, bool editor, std::string& out_broadcast_msg,
+                            std::vector<ConnId>& out_targets) {
     std::lock_guard<std::mutex> lock(registry_mutex_);
     auto it = rooms_.find(note_id);
     if (it == rooms_.end()) {
         it = rooms_.emplace(note_id, std::make_shared<Room>(note_id)).first;
     }
     std::shared_ptr<Room> room = it->second;
-    fd_to_note_id_[fd] = note_id;
-    room->join(fd, user_id, email);
+    fd_to_note_id_[id.fd] = note_id;
+    room->join(id, user_id, email, editor);
 
     auto participants = room->getParticipants();
     nlohmann::json users_json = nlohmann::json::array();
@@ -76,17 +77,17 @@ bool RoomRegistry::joinRoom(const std::string& note_id, int fd, const std::strin
                                    {"email", email},     {"users", users_json}};
 
     out_broadcast_msg = presence_msg.dump();
-    out_target_fds = room->getTargetFds(-1);
+    out_targets = room->getTargets(-1);
     return true;
 }
 
-void RoomRegistry::unregisterFd(int fd, std::string& out_broadcast_msg,
-                                std::vector<int>& out_target_fds) {
+void RoomRegistry::unregisterFd(ConnId id, std::string& out_broadcast_msg,
+                                std::vector<ConnId>& out_targets) {
     out_broadcast_msg.clear();
-    out_target_fds.clear();
+    out_targets.clear();
 
     std::lock_guard<std::mutex> lock(registry_mutex_);
-    auto it = fd_to_note_id_.find(fd);
+    auto it = fd_to_note_id_.find(id.fd);
     if (it == fd_to_note_id_.end()) {
         return;
     }
@@ -98,7 +99,7 @@ void RoomRegistry::unregisterFd(int fd, std::string& out_broadcast_msg,
     if (rit != rooms_.end()) {
         std::shared_ptr<Room> room = rit->second;
         std::string user_id;
-        bool is_empty = room->leave(fd, user_id);
+        bool is_empty = room->leave(id.fd, user_id);
 
         if (is_empty) {
             rooms_.erase(rit);
@@ -115,21 +116,21 @@ void RoomRegistry::unregisterFd(int fd, std::string& out_broadcast_msg,
                                            {"user_id", user_id},
                                            {"users", users_json}};
             out_broadcast_msg = presence_msg.dump();
-            out_target_fds = room->getTargetFds(-1);
+            out_targets = room->getTargets(-1);
         }
     }
 }
 
-void RoomRegistry::handleMessage(int fd, const std::string& json_payload,
-                                 std::string& out_broadcast_msg, std::vector<int>& out_target_fds) {
+void RoomRegistry::handleMessage(ConnId sender, const std::string& json_payload,
+                                 std::string& out_broadcast_msg, std::vector<ConnId>& out_targets) {
     out_broadcast_msg.clear();
-    out_target_fds.clear();
+    out_targets.clear();
 
     std::shared_ptr<Room> room;
     std::string note_id;
     {
         std::lock_guard<std::mutex> lock(registry_mutex_);
-        auto it = fd_to_note_id_.find(fd);
+        auto it = fd_to_note_id_.find(sender.fd);
         if (it == fd_to_note_id_.end()) {
             return;
         }
@@ -142,11 +143,14 @@ void RoomRegistry::handleMessage(int fd, const std::string& json_payload,
     }
 
     auto j = nlohmann::json::parse(json_payload, nullptr, false);
-    if (j.is_discarded() || !j.is_object() || !j.contains("type")) {
+    if (j.is_discarded() || !j.is_object() || !j.contains("type") || !j["type"].is_string()) {
         return;
     }
 
-    Participant sender = room->getParticipant(fd);
+    Participant sender_p = room->getParticipant(sender.fd);
+    if (sender_p.id.gen != sender.gen) {
+        return;
+    }
     std::string type = j["type"].get<std::string>();
 
     if (type == "presence") {
@@ -157,17 +161,32 @@ void RoomRegistry::handleMessage(int fd, const std::string& json_payload,
         }
         j["users"] = users_json;
         out_broadcast_msg = j.dump();
-        out_target_fds = room->getTargetFds(-1);
+        out_targets = room->getTargets(-1);
     } else if (type == "save" || type == "saved") {
         j["type"] = "saved";
-        j["sender_id"] = sender.user_id;
-        j["sender_email"] = sender.email;
+        if (sender_p.user_id.empty()) {
+            return;
+        }
+        j["sender_id"] = sender_p.user_id;
+        j["sender_email"] = sender_p.email;
         out_broadcast_msg = j.dump();
-        out_target_fds = room->getTargetFds(-1);
+        out_targets = room->getTargets(-1);
     }
 }
 
-std::vector<int> RoomRegistry::getRelayTargets(int sender_fd) {
+bool RoomRegistry::canRelayBinary(int sender_fd) {
+    std::lock_guard<std::mutex> lock(registry_mutex_);
+    auto it = fd_to_note_id_.find(sender_fd);
+    if (it == fd_to_note_id_.end())
+        return false;
+    auto rit = rooms_.find(it->second);
+    if (rit == rooms_.end())
+        return false;
+    // Viewers must not relay document mutations.
+    return rit->second->getParticipant(sender_fd).editor;
+}
+
+std::vector<ConnId> RoomRegistry::getRelayTargets(int sender_fd) {
     std::lock_guard<std::mutex> lock(registry_mutex_);
     auto it = fd_to_note_id_.find(sender_fd);
     if (it == fd_to_note_id_.end())
@@ -175,5 +194,5 @@ std::vector<int> RoomRegistry::getRelayTargets(int sender_fd) {
     auto rit = rooms_.find(it->second);
     if (rit == rooms_.end())
         return {};
-    return rit->second->getTargetFds(sender_fd);
+    return rit->second->getTargets(sender_fd);
 }

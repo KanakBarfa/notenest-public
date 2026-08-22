@@ -1,10 +1,16 @@
 #include <notenest/auth_middleware.hpp>
 #include <notenest/crypto.hpp>
+#include <notenest/observability.hpp>
 
-AuthMiddleware::AuthMiddleware(AuthService& auth_service) : auth_service_(auth_service) {}
+namespace {
+constexpr const char* kDenylistPrefix = "jwt:denylist:";
+}
+
+AuthMiddleware::AuthMiddleware(AuthService& auth_service, Cache* denylist_cache)
+    : auth_service_(auth_service), denylist_cache_(denylist_cache) {}
 
 std::optional<std::string> AuthMiddleware::authenticate(const HttpRequest& req) const {
-    // Extract token from Authorization header or ?token= query param (SSE/WS).
+    // Authorization header only; no query-string tokens.
     std::string token;
     auto auth_it = req.headers.find("authorization");
     if (auth_it != req.headers.end() && auth_it->second.rfind("Bearer ", 0) == 0) {
@@ -12,23 +18,23 @@ std::optional<std::string> AuthMiddleware::authenticate(const HttpRequest& req) 
     }
 
     if (token.empty()) {
-        size_t qpos = req.path.find('?');
-        if (qpos != std::string::npos) {
-            std::string query = req.path.substr(qpos + 1);
-            for (const auto& prefix : {"token=", "access_token="}) {
-                size_t tpos = query.find(prefix);
-                if (tpos != std::string::npos) {
-                    token = query.substr(tpos + std::string(prefix).length());
-                    size_t amp = token.find('&');
-                    if (amp != std::string::npos)
-                        token = token.substr(0, amp);
-                    break;
-                }
-            }
+        Observability::logJson("DEBUG", "Auth rejected: missing bearer token");
+        return std::nullopt;
+    }
+
+    auto claims = Crypto::verifyTokenClaims(token, auth_service_.getSecret());
+    if (!claims) {
+        Observability::logJson("DEBUG",
+                               "Auth rejected: invalid or expired token (signature/exp/iss/alg)");
+        return std::nullopt;
+    }
+
+    if (denylist_cache_ && !claims->jti.empty()) {
+        if (denylist_cache_->get(std::string(kDenylistPrefix) + claims->jti)) {
+            Observability::logJson("DEBUG", "Auth rejected: token revoked (jti in denylist)");
+            return std::nullopt;
         }
     }
 
-    if (token.empty())
-        return std::nullopt;
-    return Crypto::verifyToken(token, auth_service_.getSecret());
+    return claims->user_id;
 }

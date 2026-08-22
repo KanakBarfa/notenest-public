@@ -1,6 +1,7 @@
 #ifndef CRYPTO_HPP
 #define CRYPTO_HPP
 
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <sodium.h>
 
@@ -15,11 +16,27 @@
 
 namespace Crypto {
 
+static constexpr int MAX_TOKEN_TTL_SECONDS = 86400;  // Server-capped token lifetime (24h).
+
 // Initializes libsodium library.
 inline void init() {
     if (sodium_init() < 0) {
         throw std::runtime_error("libsodium initialization failed");
     }
+}
+
+// Returns cryptographically secure random bytes as a lowercase hex string.
+inline std::string randomHex(size_t num_bytes) {
+    static const char* hex = "0123456789abcdef";
+    std::vector<unsigned char> buf(num_bytes);
+    randombytes_buf(buf.data(), buf.size());
+    std::string out;
+    out.reserve(num_bytes * 2);
+    for (unsigned char b : buf) {
+        out.push_back(hex[b >> 4]);
+        out.push_back(hex[b & 0x0F]);
+    }
+    return out;
 }
 
 static const std::string BASE64_CHARS =
@@ -137,15 +154,22 @@ inline bool verifyPassword(const std::string& password, const std::string& hash)
     return crypto_pwhash_str_verify(hash.c_str(), password.c_str(), password.length()) == 0;
 }
 
-// Generates JWT token with user_id and expiry.
+// Generates JWT token with user_id, jti and capped expiry.
 inline std::string generateToken(const std::string& user_id, const std::string& secret,
                                  int expiry_seconds) {
+    if (expiry_seconds <= 0) {
+        expiry_seconds = MAX_TOKEN_TTL_SECONDS;
+    }
+    expiry_seconds = std::min(expiry_seconds, MAX_TOKEN_TTL_SECONDS);
+
     nlohmann::json header = {{"alg", "HS256"}, {"typ", "JWT"}};
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
                    std::chrono::system_clock::now().time_since_epoch())
                    .count();
-    nlohmann::json payload = {
-        {"user_id", user_id}, {"iss", "notenest"}, {"exp", now + expiry_seconds}};
+    nlohmann::json payload = {{"user_id", user_id},
+                              {"iss", "notenest"},
+                              {"jti", randomHex(16)},
+                              {"exp", now + expiry_seconds}};
 
     std::string header_enc = base64url_encode(header.dump());
     std::string payload_enc = base64url_encode(payload.dump());
@@ -157,51 +181,85 @@ inline std::string generateToken(const std::string& user_id, const std::string& 
     return signing_input + "." + signature_enc;
 }
 
-// Verifies JWT token and returns user_id if valid, otherwise nullopt.
-inline std::optional<std::string> verifyToken(const std::string& token, const std::string& secret) {
+// Verified token claims.
+struct TokenClaims {
+    std::string user_id;
+    std::string jti;
+    long long exp = 0;
+};
+
+// Strict JWT verification (HS256 only, constant-time compare, iss/exp checks).
+inline std::optional<TokenClaims> verifyTokenClaims(const std::string& token,
+                                                    const std::string& secret) {
     size_t dot1 = token.find('.');
     if (dot1 == std::string::npos)
         return std::nullopt;
     size_t dot2 = token.find('.', dot1 + 1);
     if (dot2 == std::string::npos)
         return std::nullopt;
+    if (token.find('.', dot2 + 1) != std::string::npos)
+        return std::nullopt;
 
     std::string header_enc = token.substr(0, dot1);
     std::string payload_enc = token.substr(dot1 + 1, dot2 - dot1 - 1);
     std::string signature_enc = token.substr(dot2 + 1);
 
-    std::string signing_input = header_enc + "." + payload_enc;
-    std::string expected_sig;
     try {
-        expected_sig = hmac_sha256(signing_input, secret);
-    } catch (...) {
-        return std::nullopt;
-    }
-    std::string expected_sig_enc = base64url_encode(expected_sig);
+        auto header = nlohmann::json::parse(base64url_decode(header_enc));
+        if (!header.is_object() || !header.contains("alg") || header["alg"] != "HS256") {
+            return std::nullopt;  // HS256 only.
+        }
 
-    if (signature_enc != expected_sig_enc) {
-        return std::nullopt;
-    }
+        std::string signing_input = header_enc + "." + payload_enc;
+        std::string expected_sig = hmac_sha256(signing_input, secret);
+        std::string provided_sig = base64url_decode(signature_enc);
 
-    try {
-        std::string payload_str = base64url_decode(payload_enc);
-        auto payload = nlohmann::json::parse(payload_str);
-        if (!payload.contains("user_id") || !payload.contains("exp")) {
+        if (provided_sig.size() != expected_sig.size() ||
+            CRYPTO_memcmp(provided_sig.data(), expected_sig.data(), expected_sig.size()) != 0) {
             return std::nullopt;
         }
+
+        auto payload = nlohmann::json::parse(base64url_decode(payload_enc));
+        if (!payload.is_object() || !payload.contains("user_id") || !payload.contains("exp") ||
+            !payload.contains("iss")) {
+            return std::nullopt;
+        }
+        if (!payload["user_id"].is_string() || !payload["iss"].is_string() ||
+            payload["iss"].get<std::string>() != "notenest") {
+            return std::nullopt;
+        }
+
+        TokenClaims claims;
+        claims.user_id = payload["user_id"].get<std::string>();
+        if (claims.user_id.empty()) {
+            return std::nullopt;
+        }
+        claims.exp = payload["exp"].get<long long>();
 
         auto now = std::chrono::duration_cast<std::chrono::seconds>(
                        std::chrono::system_clock::now().time_since_epoch())
                        .count();
-        long long exp = payload["exp"].get<long long>();
-        if (now > exp) {
+        if (now > claims.exp) {
             return std::nullopt;
         }
 
-        return payload["user_id"].get<std::string>();
+        if (payload.contains("jti") && payload["jti"].is_string()) {
+            claims.jti = payload["jti"].get<std::string>();
+        }
+
+        return claims;
     } catch (...) {
         return std::nullopt;
     }
+}
+
+// Verifies JWT token and returns user_id if valid, otherwise nullopt.
+inline std::optional<std::string> verifyToken(const std::string& token, const std::string& secret) {
+    auto claims = verifyTokenClaims(token, secret);
+    if (!claims) {
+        return std::nullopt;
+    }
+    return claims->user_id;
 }
 
 }  // namespace Crypto

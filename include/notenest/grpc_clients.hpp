@@ -44,10 +44,13 @@ class UserGrpcClient {
 public:
     explicit UserGrpcClient(std::string target_address = "user:50052");
 
+    // requester_id scopes returned emails to note relationships.
     std::optional<UserProfile> getUserProfile(const std::string& user_id,
-                                              const std::string& trace_id = "");
+                                              const std::string& trace_id = "",
+                                              const std::string& requester_id = "");
     std::vector<UserProfile> getUsersByIDs(const std::vector<std::string>& user_ids,
-                                           const std::string& trace_id = "");
+                                           const std::string& trace_id = "",
+                                           const std::string& requester_id = "");
 
 private:
     std::unique_ptr<notenest::user::UserService::Stub> stub_;

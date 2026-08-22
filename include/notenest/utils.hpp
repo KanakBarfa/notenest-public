@@ -18,6 +18,9 @@ std::string generateUUID();
 // Validates and returns UUID string if valid.
 std::optional<std::string> parseUUID(const std::string& id_str);
 
+// Rejects unsafe attachment filenames (separators, traversal, control chars).
+std::optional<std::string> sanitizeFilename(const std::string& name);
+
 // Standard URL encoding helper.
 std::string urlEncode(const std::string& str);
 

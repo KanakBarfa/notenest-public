@@ -1,24 +1,22 @@
 #ifndef EVENT_BUS_HPP
 #define EVENT_BUS_HPP
 
-#include <atomic>
+#include <functional>
 #include <mutex>
-#include <set>
+#include <notenest/conn_id.hpp>
 #include <string>
-#include <thread>
 #include <unordered_map>
 
-// Event bus managing SSE subscriber connections and broadcasting events.
+// SSE subscriber registry; delivery goes through a generation-checked sink.
 class EventBus {
 public:
-    EventBus();
-    ~EventBus();
+    using Sink = std::function<bool(int fd, uint64_t gen, const std::string& data)>;
 
-    // Subscribes a client socket fd for a user ID.
-    void subscribe(const std::string& user_id, int fd);
+    // Installs the delivery sink (wired by HttpServer at construction).
+    void setSink(Sink sink);
 
-    // Unsubscribes a client socket fd for a user ID.
-    void unsubscribe(const std::string& user_id, int fd);
+    // Subscribes a client connection for a user ID.
+    void subscribe(const std::string& user_id, ConnId id);
 
     // Unsubscribes a socket fd from all user IDs.
     void unsubscribeFd(int fd);
@@ -26,24 +24,18 @@ public:
     // Publishes a JSON event string to a specific user.
     void publish(const std::string& user_id, const std::string& event_json);
 
-    // Sends heartbeat keep-alive comment to all connected SSE clients.
-    void heartbeat();
+    // Formats a raw SSE payload as an HTTP chunked frame.
+    static std::string formatSseFrame(const std::string& raw);
 
-    // Starts background heartbeat thread.
-    void startHeartbeat(int interval_seconds = 15);
-
-    // Stops background heartbeat thread.
-    void stopHeartbeat();
+    // Preformatted keep-alive comment chunk for timerfd-driven heartbeats.
+    static const std::string& keepAliveFrame();
 
 private:
     mutable std::mutex mutex_;
-    std::unordered_map<std::string, std::set<int>> subscribers_;
+    // user_id -> { fd -> generation }
+    std::unordered_map<std::string, std::unordered_map<int, uint64_t>> subscribers_;
     std::unordered_map<int, std::string> fd_to_user_;
-
-    std::atomic<bool> running_{false};
-    std::thread heartbeat_thread_;
-
-    bool sendData(int fd, const std::string& data);
+    Sink sink_;
 };
 
 #endif

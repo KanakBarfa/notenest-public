@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const { ApolloServer } = require('@apollo/server');
 const { expressMiddleware } = require('@apollo/server/express4');
+const { GraphQLError } = require('graphql');
 const DataLoader = require('dataloader');
 const { Pool } = require('pg');
 const jwt = require('jsonwebtoken');
@@ -10,7 +11,21 @@ const crypto = require('crypto');
 require('dotenv').config();
 
 const PORT = process.env.PORT || 4000;
-const JWT_SECRET = process.env.JWT_SECRET || 'default_super_secure_jwt_secret_key_12345_67890';
+if (
+  !process.env.JWT_SECRET ||
+  process.env.JWT_SECRET === 'default_super_secure_jwt_secret_key_12345_67890'
+) {
+  console.error(
+    JSON.stringify({
+      level: 'CRITICAL',
+      service: 'graphql-service',
+      message:
+        'FATAL: JWT_SECRET is missing, empty, or a known insecure default. Set a strong random value (e.g. `make setup` or `openssl rand -hex 64`).'
+    })
+  );
+  process.exit(1);
+}
+const JWT_SECRET = process.env.JWT_SECRET;
 const DATABASE_URL = process.env.DATABASE_URL || 'postgres://postgres:pass@pgbouncer:6432/postgres';
 const DATABASE_READ_URL = process.env.DATABASE_READ_URL || 'postgres://postgres:pass@pgbouncer-read:6433/postgres';
 
@@ -152,6 +167,43 @@ const queryDB = async (text, params, isRead = true) => {
   }
 };
 
+const NOTE_PERMISSION_RANK = { viewer: 1, editor: 2, owner: 3 };
+
+// Returns the caller's permission level or null when access is denied.
+const getNoteAccess = async (userId, noteId) => {
+  if (!userId || !noteId) return null;
+  const { rows } = await queryDB(
+    `SELECT CASE
+              WHEN n.owner_id = $2::uuid THEN 'owner'
+              ELSE s.permission
+            END AS permission
+     FROM notes n
+     LEFT JOIN note_shares s ON s.note_id = n.id AND s.shared_with_user_id = $2::uuid
+     WHERE n.id = $1::uuid`,
+    [noteId, userId]
+  );
+  return rows.length > 0 && rows[0].permission ? rows[0].permission : null;
+};
+
+// Throws UNAUTHENTICATED/FORBIDDEN; returns the granted level.
+const assertNoteAccess = async (userId, noteId, requiredPermission = 'viewer') => {
+  if (!userId) {
+    throw new GraphQLError('Unauthorized', { extensions: { code: 'UNAUTHENTICATED' } });
+  }
+  const granted = await getNoteAccess(userId, noteId);
+  if (!granted) {
+    throw new GraphQLError('Note not found or access denied', {
+      extensions: { code: 'FORBIDDEN' }
+    });
+  }
+  if ((NOTE_PERMISSION_RANK[granted] || 0) < (NOTE_PERMISSION_RANK[requiredPermission] || 0)) {
+    throw new GraphQLError(`Forbidden: ${requiredPermission} access required`, {
+      extensions: { code: 'FORBIDDEN' }
+    });
+  }
+  return granted;
+};
+
 // DataLoaders batching logic to prevent N+1 query problem
 const createLoaders = () => ({
   userLoader: new DataLoader(async (userIds) => {
@@ -191,7 +243,7 @@ const createLoaders = () => ({
 const typeDefs = `#graphql
   type User {
     id: ID!
-    email: String!
+    email: String
   }
 
   type Comment {
@@ -230,7 +282,8 @@ const typeDefs = `#graphql
 
 const resolvers = {
   Query: {
-    note: async (_, { id }) => {
+    note: async (_, { id }, context) => {
+      const permission = await assertNoteAccess(context.user && context.user.id, id);
       const { rows } = await queryDB(
         `SELECT id::text, title, content, owner_id::text,
                 to_char(created_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as created_at
@@ -238,11 +291,14 @@ const resolvers = {
         [id]
       );
       if (rows.length === 0) return null;
-      return rows[0];
+      return { ...rows[0], permission };
     },
 
     notes: async (_, __, context) => {
-      let query = `
+      if (!context.user) {
+        throw new GraphQLError('Unauthorized', { extensions: { code: 'UNAUTHENTICATED' } });
+      }
+      const query = `
         SELECT n.id::text, n.title, n.content, n.owner_id::text,
                to_char(n.created_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as created_at,
                CASE WHEN n.owner_id = $1::uuid THEN 'owner' ELSE COALESCE(s.permission, 'editor') END AS permission
@@ -251,17 +307,7 @@ const resolvers = {
         WHERE n.owner_id = $1::uuid OR s.shared_with_user_id = $1::uuid
         ORDER BY n.id ASC
       `;
-      let params = [context.user ? context.user.id : '00000000-0000-0000-0000-000000000000'];
-      if (!context.user) {
-        query = `
-          SELECT id::text, title, content, owner_id::text,
-                 to_char(created_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as created_at,
-                 'owner' as permission
-          FROM notes
-          ORDER BY id ASC
-        `;
-        params = [];
-      }
+      const params = [context.user.id];
       const { rows } = await queryDB(query, params);
       return rows;
     },
@@ -271,6 +317,7 @@ const resolvers = {
     },
 
     comments: async (_, { noteId }, context) => {
+      await assertNoteAccess(context.user && context.user.id, noteId);
       return context.loaders.commentsLoader.load(noteId);
     },
 
@@ -282,7 +329,9 @@ const resolvers = {
 
   Mutation: {
     createNote: async (_, { title, content }, context) => {
-      if (!context.user) throw new Error('Unauthorized');
+      if (!context.user) {
+        throw new GraphQLError('Unauthorized', { extensions: { code: 'UNAUTHENTICATED' } });
+      }
       const { rows } = await queryDB(
         `INSERT INTO notes (title, content, owner_id)
          VALUES ($1, $2, $3::uuid)
@@ -295,7 +344,10 @@ const resolvers = {
     },
 
     createComment: async (_, { noteId, content }, context) => {
-      if (!context.user) throw new Error('Unauthorized');
+      if (!context.user) {
+        throw new GraphQLError('Unauthorized', { extensions: { code: 'UNAUTHENTICATED' } });
+      }
+      await assertNoteAccess(context.user.id, noteId, 'editor');
       const { rows } = await queryDB(
         `INSERT INTO comments (note_id, author_id, content)
          VALUES ($1::uuid, $2::uuid, $3)
@@ -308,7 +360,15 @@ const resolvers = {
     },
 
     deleteComment: async (_, { id }, context) => {
-      if (!context.user) throw new Error('Unauthorized');
+      if (!context.user) {
+        throw new GraphQLError('Unauthorized', { extensions: { code: 'UNAUTHENTICATED' } });
+      }
+      const { rows } = await queryDB(
+        `SELECT note_id::text FROM comments WHERE id = $1::uuid`,
+        [id]
+      );
+      if (rows.length === 0) return false;
+      await assertNoteAccess(context.user.id, rows[0].note_id);
       const { rowCount } = await queryDB(
         `DELETE FROM comments WHERE id = $1::uuid AND author_id = $2::uuid`,
         [id, context.user.id],
@@ -328,6 +388,15 @@ const resolvers = {
     },
     comments: (parent, _, context) => {
       return context.loaders.commentsLoader.load(parent.id);
+    },
+  },
+
+  User: {
+    email: (parent, _, context) => {
+      if (context.user && context.user.id === (parent.id || parent.user_id)) {
+        return parent.email || null;
+      }
+      return null;
     },
   },
 
@@ -414,13 +483,14 @@ async function startServer() {
         const authHeader = req.headers.authorization;
         if (authHeader && authHeader.startsWith('Bearer ')) {
           token = authHeader.substring(7);
-        } else if (req.query && (req.query.token || req.query.access_token)) {
-          token = req.query.token || req.query.access_token;
         }
 
         if (token) {
           try {
-            const decoded = jwt.verify(token, JWT_SECRET);
+            const decoded = jwt.verify(token, JWT_SECRET, {
+              algorithms: ['HS256'],
+              issuer: 'notenest'
+            });
             user = { id: decoded.user_id };
           } catch (err) {
             logJson('WARN', `JWT verification failed: ${err.message}`, req.traceId, req.spanId);

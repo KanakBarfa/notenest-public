@@ -28,9 +28,18 @@ fi
 echo "User A token acquired."
 echo "User B token acquired."
 
-# 2. Start SSE listener for User B in background
+# 2. SSE listener for User B via one-time ticket (no headers on EventSource).
+get_sse_ticket() {
+    curl -s -X POST -H "Authorization: Bearer $1" "$SERVER_URL/realtime/ticket" | jq -r '.ticket'
+}
+ticket_b=$(get_sse_ticket "$token_b")
+if [ -z "$ticket_b" ] || [ "$ticket_b" == "null" ]; then
+    echo "Assertion FAILED: Failed to obtain realtime ticket for User B"
+    exit 1
+fi
+
 sse_out=$(mktemp)
-curl -s -N "$SERVER_URL/events?token=$token_b" > "$sse_out" 2>&1 &
+curl -s -N "$SERVER_URL/events?ticket=$ticket_b" > "$sse_out" 2>&1 &
 SSE_PID=$!
 
 cleanup_sse() {
@@ -41,6 +50,14 @@ trap cleanup_sse EXIT
 
 # Give SSE stream connection time to establish
 sleep 1
+
+# 2b. Tickets are single-use: replaying a redeemed ticket must be rejected
+replay_status=$(curl -s -o /dev/null -w "%{http_code}" "$SERVER_URL/events?ticket=$ticket_b")
+if [ "$replay_status" -ne 401 ]; then
+    echo "Assertion FAILED: Expected 401 on replayed realtime ticket, got $replay_status"
+    exit 1
+fi
+echo "Realtime ticket single-use enforcement verified!"
 
 # 3. User A creates a note
 create_res=$(curl -s -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $token_a" -d '{"title":"SSE Shared Note Title","content":"Hello SSE world!"}' "$SERVER_URL/notes")

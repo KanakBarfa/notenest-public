@@ -1,4 +1,5 @@
 #include <chrono>
+#include <cstdlib>
 #include <notenest/consul_client.hpp>
 #include <notenest/grpc_clients.hpp>
 
@@ -69,6 +70,18 @@ AuthResult AuthGrpcClient::login(const std::string& email, const std::string& pa
     return res;
 }
 
+namespace {
+void addInternalAuthMetadata(grpc::ClientContext& context, const std::string& requester_id) {
+    const char* secret = std::getenv("INTERNAL_SHARED_SECRET");
+    if (secret != nullptr && *secret != '\0') {
+        context.AddMetadata("x-internal-secret", secret);
+    }
+    if (!requester_id.empty()) {
+        context.AddMetadata("x-requester-id", requester_id);
+    }
+}
+}  // namespace
+
 UserGrpcClient::UserGrpcClient(std::string target_address) {
     ConsulClient consul;
     std::string resolved_target = consul.resolveGrpcTarget(target_address, "user-service");
@@ -80,12 +93,14 @@ UserGrpcClient::UserGrpcClient(std::string target_address) {
 }
 
 std::optional<UserProfile> UserGrpcClient::getUserProfile(const std::string& user_id,
-                                                          const std::string& trace_id) {
+                                                          const std::string& trace_id,
+                                                          const std::string& requester_id) {
     grpc::ClientContext context;
     context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(3));
     if (!trace_id.empty()) {
         context.AddMetadata("trace-id", trace_id);
     }
+    addInternalAuthMetadata(context, requester_id);
 
     notenest::user::GetUserProfileRequest request;
     request.set_user_id(user_id);
@@ -104,12 +119,14 @@ std::optional<UserProfile> UserGrpcClient::getUserProfile(const std::string& use
 }
 
 std::vector<UserProfile> UserGrpcClient::getUsersByIDs(const std::vector<std::string>& user_ids,
-                                                       const std::string& trace_id) {
+                                                       const std::string& trace_id,
+                                                       const std::string& requester_id) {
     grpc::ClientContext context;
     context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(3));
     if (!trace_id.empty()) {
         context.AddMetadata("trace-id", trace_id);
     }
+    addInternalAuthMetadata(context, requester_id);
 
     notenest::user::GetUsersByIDsRequest request;
     for (const auto& id : user_ids) {

@@ -14,6 +14,14 @@ fi
 
 echo "[Phase 14] Testing Microservices & gRPC Architecture..."
 
+# Internal shared secret for user-service RPC gating
+ROOT_DIR=$(cd "$SCRIPT_DIR/../.." && pwd)
+INTERNAL_SECRET="${INTERNAL_SHARED_SECRET:-}"
+if [ -z "$INTERNAL_SECRET" ] && [ -f "$ROOT_DIR/.env" ]; then
+    # shellcheck disable=SC1090
+    INTERNAL_SECRET=$(grep -E '^INTERNAL_SHARED_SECRET=' "$ROOT_DIR/.env" | tail -n1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d ' ')
+fi
+
 AUTH_HOST="localhost:50051"
 USER_HOST="localhost:50052"
 NOTE_HOST="localhost:50053"
@@ -56,14 +64,28 @@ if ! echo "$VERIFY_RESP" | grep -q '"valid": true'; then
 fi
 
 echo "2. Testing User gRPC Service (GetUserProfile, GetUsersByIDs)..."
-PROFILE_RESP=$($GRPCURL -plaintext -d "{\"user_id\": \"$USER_ID\"}" "$USER_HOST" notenest.user.UserService/GetUserProfile)
+
+if [ -z "$INTERNAL_SECRET" ]; then
+    echo "FAILED: INTERNAL_SHARED_SECRET not set (.env or environment) - user RPCs are gated"
+    exit 1
+fi
+
+# Requests without the internal shared secret must be denied
+DENIED_RESP=$($GRPCURL -plaintext -d "{\"user_id\": \"$USER_ID\"}" "$USER_HOST" notenest.user.UserService/GetUserProfile 2>&1 || true)
+echo "Unauthenticated GetUserProfile Response: $DENIED_RESP"
+if ! echo "$DENIED_RESP" | grep -qiE "PermissionDenied|Permission Denied|permission_denied"; then
+    echo "FAILED: GetUserProfile without internal secret should be denied"
+    exit 1
+fi
+
+PROFILE_RESP=$($GRPCURL -plaintext -H "x-internal-secret: $INTERNAL_SECRET" -d "{\"user_id\": \"$USER_ID\"}" "$USER_HOST" notenest.user.UserService/GetUserProfile)
 echo "GetUserProfile Response: $PROFILE_RESP"
 if ! echo "$PROFILE_RESP" | grep -q "$TEST_EMAIL"; then
     echo "FAILED: User profile email mismatch"
     exit 1
 fi
 
-BATCH_RESP=$($GRPCURL -plaintext -d "{\"user_ids\": [\"$USER_ID\"]}" "$USER_HOST" notenest.user.UserService/GetUsersByIDs)
+BATCH_RESP=$($GRPCURL -plaintext -H "x-internal-secret: $INTERNAL_SECRET" -d "{\"user_ids\": [\"$USER_ID\"]}" "$USER_HOST" notenest.user.UserService/GetUsersByIDs)
 echo "GetUsersByIDs Response: $BATCH_RESP"
 
 echo "3. Testing Note gRPC Service (CreateNote, ListNotes)..."

@@ -215,7 +215,7 @@ services:
     container_name: notenest-auth-container
     environment:
       DATABASE_URL: host=pgbouncer port=6432 dbname=${DB_NAME:-postgres} user=${DB_USER:-postgres} password=${DB_PASSWORD:-pass}
-      JWT_SECRET: ${JWT_SECRET:-default_super_secure_jwt_secret_key_12345_67890}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required - run "make setup"}
       PORT: 50051
       CONSUL_HOST: consul
       CONSUL_PORT: 8500
@@ -244,6 +244,7 @@ services:
     container_name: notenest-user-container
     environment:
       DATABASE_URL: host=pgbouncer port=6432 dbname=${DB_NAME:-postgres} user=${DB_USER:-postgres} password=${DB_PASSWORD:-pass}
+      INTERNAL_SHARED_SECRET: ${INTERNAL_SHARED_SECRET:-}
       PORT: 50052
       CONSUL_HOST: consul
       CONSUL_PORT: 8500
@@ -320,7 +321,7 @@ services:
       DATABASE_URL: host=pgbouncer port=6432 dbname=${DB_NAME:-postgres} user=${DB_USER:-postgres} password=${DB_PASSWORD:-pass}
       REDIS_HOST: redis
       REDIS_PORT: 6379
-      JWT_SECRET: ${JWT_SECRET:-default_super_secure_jwt_secret_key_12345_67890}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required - run "make setup"}
       MINIO_ENDPOINT: ${MINIO_ENDPOINT:-http://minio:9000}
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
@@ -401,7 +402,7 @@ services:
       - "4000:4000"
     environment:
       DATABASE_URL: host=pgbouncer port=6432 dbname=${DB_NAME:-postgres} user=${DB_USER:-postgres} password=${DB_PASSWORD:-pass}
-      JWT_SECRET: ${JWT_SECRET:-default_super_secure_jwt_secret_key_12345_67890}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required - run "make setup"}
       PORT: 4000
       CONSUL_HOST: consul
       CONSUL_PORT: 8500

@@ -2,11 +2,14 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <sys/timerfd.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <cerrno>
 #include <chrono>
-#include <cstdio>
 #include <cstring>
 #include <notenest/http_parser.hpp>
 #include <notenest/http_server.hpp>
@@ -14,311 +17,652 @@
 #include <print>
 #include <vector>
 
-constexpr int MAX_EVENTS = 64;
+using namespace std::chrono_literals;
 
-HttpServer::HttpServer(int port, Router& router, EventBus* event_bus, RoomRegistry* room_registry)
-    : port_(port), router_(router), event_bus_(event_bus), room_registry_(room_registry) {}
+namespace {
+std::atomic<uint64_t> g_next_gen{1};
+
+std::chrono::steady_clock::time_point now() {
+    return std::chrono::steady_clock::now();
+}
+
+int64_t elapsedSecs(std::chrono::steady_clock::time_point from) {
+    return std::chrono::duration_cast<std::chrono::seconds>(now() - from).count();
+}
+}  // namespace
+
+// BlockingPool: bounded pool executing blocking handlers off the event loops.
+
+HttpServer::BlockingPool::BlockingPool(size_t threads) {
+    threads_.reserve(threads);
+    for (size_t i = 0; i < threads; ++i) {
+        threads_.emplace_back([this] { workerLoop(); });
+    }
+}
+
+HttpServer::BlockingPool::~BlockingPool() {
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        stopping_ = true;
+    }
+    cv_.notify_all();
+    // Ordered shutdown: workers exit once the queue drains.
+    for (auto& t : threads_) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+}
+
+void HttpServer::BlockingPool::workerLoop() {
+    for (;;) {
+        std::function<void()> task;
+        {
+            std::unique_lock<std::mutex> lock(mu_);
+            cv_.wait(lock, [this] { return stopping_ || !tasks_.empty(); });
+            if (tasks_.empty()) {
+                if (stopping_)
+                    return;
+                continue;
+            }
+            task = std::move(tasks_.front());
+            tasks_.pop_front();
+        }
+        try {
+            task();
+        } catch (const std::exception& e) {
+            std::println(stderr, "[Pool] Task exception: {}", e.what());
+        } catch (...) {
+            std::println(stderr, "[Pool] Unknown task exception");
+        }
+    }
+}
+
+void HttpServer::BlockingPool::submit(std::function<void()> task) {
+    bool queued = false;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!stopping_) {
+            tasks_.push_back(std::move(task));
+            queued = true;
+        }
+    }
+    if (queued) {
+        cv_.notify_one();
+    } else {
+        std::println(stderr, "[Pool] Submit rejected during shutdown");
+    }
+}
+
+HttpServer::HttpServer(int port, Router& router, EventBus* event_bus, RoomRegistry* room_registry,
+                       unsigned worker_count)
+    : port_(port),
+      router_(router),
+      event_bus_(event_bus),
+      room_registry_(room_registry),
+      blocking_(16) {
+    unsigned n = worker_count ? worker_count : std::thread::hardware_concurrency();
+    if (n == 0)
+        n = 4;
+    n = std::clamp(n, 2u, 8u);
+
+    workers_.reserve(n);
+    for (unsigned i = 0; i < n; ++i) {
+        auto w = std::make_unique<Worker>();
+        w->idx = i;
+        workers_.push_back(std::move(w));
+    }
+
+    if (event_bus_) {
+        event_bus_->setSink([this](int fd, uint64_t gen, const std::string& data) -> bool {
+            return postTo(fd, gen, data, false);
+        });
+    }
+}
 
 HttpServer::~HttpServer() {
     stop();
 }
 
+HttpServer::Worker& HttpServer::ownerOf(int fd) {
+    // Deterministic ownership shared by acceptor and all publishers.
+    size_t idx = static_cast<size_t>(fd) % workers_.size();
+    return *workers_[idx];
+}
+
+bool HttpServer::postTo(int fd, uint64_t gen, std::string data, bool close_after) {
+    Worker& w = ownerOf(fd);
+    {
+        std::lock_guard<std::mutex> lock(w.mu);
+        auto it = w.conns.find(fd);
+        if (it == w.conns.end() || it->second.gen != gen) {
+            return false;  // stale handle: fd closed or reused
+        }
+        w.tasks.push_back([this, &w, fd, gen, data = std::move(data), close_after]() mutable {
+            applyOutbound(w, fd, gen, std::move(data), close_after);
+        });
+    }
+    uint64_t one = 1;
+    ssize_t rc = write(w.wake_efd, &one, sizeof(one));
+    (void)rc;
+    return true;
+}
+
 void HttpServer::start() {
-    server_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+    if (running_.exchange(true)) {
+        return;
+    }
+
+    server_fd_ = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (server_fd_ < 0) {
         std::println(stderr, "Failed to create socket, errno: {}", errno);
+        running_ = false;
         return;
     }
 
     int opt = 1;
-    if (setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        std::println(stderr, "Failed to set socket options");
-        return;
-    }
+    setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    struct sockaddr_in address;
-    std::memset(&address, 0, sizeof(address));
+    struct sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(port_);
 
-    if (bind(server_fd_, (struct sockaddr*)&address, sizeof(address)) < 0) {
-        std::println(stderr, "Failed to bind socket to port {}, errno: {}", port_, errno);
-        return;
-    }
-
-    if (listen(server_fd_, SOMAXCONN) < 0) {
-        std::println(stderr, "Failed to listen, errno: {}", errno);
-        return;
-    }
-
-    int flags = fcntl(server_fd_, F_GETFL, 0);
-    if (flags < 0 || fcntl(server_fd_, F_SETFL, flags | O_NONBLOCK) < 0) {
-        std::println(stderr, "Failed to set non-blocking on server socket");
-        return;
-    }
-
-    epoll_fd_ = epoll_create1(0);
-    if (epoll_fd_ < 0) {
-        std::println(stderr, "Failed to create epoll, errno: {}", errno);
-        return;
-    }
-
-    struct epoll_event ev;
-    ev.events = EPOLLIN;
-    ev.data.fd = server_fd_;
-    if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, server_fd_, &ev) < 0) {
-        std::println(stderr, "Failed to register server socket with epoll");
-        return;
-    }
-
-    running_ = true;
-    std::println("Server listening on port {} using epoll loop", port_);
-
-    std::vector<struct epoll_event> events(MAX_EVENTS);
-
-    while (running_) {
-        int nfds = epoll_wait(epoll_fd_, events.data(), MAX_EVENTS, 100);
-        if (nfds < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            std::println(stderr, "epoll_wait error, errno: {}", errno);
-            break;
-        }
-
-        for (int i = 0; i < nfds; ++i) {
-            int fd = events[i].data.fd;
-
-            if (fd == server_fd_) {
-                while (true) {
-                    struct sockaddr_in client_addr;
-                    socklen_t client_len = sizeof(client_addr);
-                    int client_fd = accept(server_fd_, (struct sockaddr*)&client_addr, &client_len);
-                    if (client_fd < 0) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                            break;
-                        }
-                        std::println(stderr, "Accept error, errno: {}", errno);
-                        break;
-                    }
-
-                    int cflags = fcntl(client_fd, F_GETFL, 0);
-                    if (cflags < 0 || fcntl(client_fd, F_SETFL, cflags | O_NONBLOCK) < 0) {
-                        std::println(stderr, "Failed to set non-blocking on client socket");
-                        close(client_fd);
-                        continue;
-                    }
-
-                    struct epoll_event cev;
-                    cev.events = EPOLLIN;
-                    cev.data.fd = client_fd;
-                    if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, client_fd, &cev) < 0) {
-                        std::println(stderr, "Failed to add client socket to epoll");
-                        close(client_fd);
-                        continue;
-                    }
-
-                    connections_[client_fd] = Connection{client_fd, "", false};
-                }
-            } else {
-                if (events[i].events & (EPOLLERR | EPOLLHUP)) {
-                    closeConnection(fd);
-                } else if (events[i].events & EPOLLIN) {
-                    handleRead(fd);
-                }
-            }
-        }
-    }
-}
-
-void HttpServer::stop() {
-    if (!running_) {
-        return;
-    }
-    running_ = false;
-
-    // Close listening server socket first to stop accepting new connection requests
-    if (server_fd_ >= 0) {
-        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, server_fd_, nullptr);
-        close(server_fd_);
+    if (bind(server_fd_, reinterpret_cast<struct sockaddr*>(&address), sizeof(address)) < 0 ||
+        listen(server_fd_, SOMAXCONN) < 0) {
+        std::println(stderr, "Failed to bind/listen port {}, errno: {}", port_, errno);
+        ::close(server_fd_);
         server_fd_ = -1;
+        running_ = false;
+        return;
     }
 
-    // Drain active in-flight requests gracefully up to 1 second
-    std::println("[HttpServer] Connection draining active connections...");
-    struct epoll_event events[MAX_EVENTS];
-    auto start_drain = std::chrono::steady_clock::now();
-    while (!connections_.empty()) {
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                           std::chrono::steady_clock::now() - start_drain)
-                           .count();
-        if (elapsed > 1000) {
-            break;
-        }
-        int nfds = epoll_wait(epoll_fd_, events, MAX_EVENTS, 50);
-        if (nfds > 0) {
-            for (int i = 0; i < nfds; ++i) {
-                int fd = events[i].data.fd;
-                if (events[i].events & (EPOLLERR | EPOLLHUP)) {
-                    closeConnection(fd);
-                } else if (events[i].events & EPOLLIN) {
-                    handleRead(fd);
-                }
-            }
+    for (auto& w : workers_) {
+        w->thread = std::make_unique<std::thread>([this, ptr = w.get()] { runWorker(ptr); });
+    }
+
+    std::println("Server listening on port {} with {} epoll workers", port_, workers_.size());
+    runAcceptor();
+
+    // Acceptor returned: stop() was requested. Wait for workers to drain.
+    for (auto& w : workers_) {
+        if (w->thread && w->thread->joinable()) {
+            w->thread->join();
         }
     }
-
-    if (epoll_fd_ >= 0) {
-        close(epoll_fd_);
-        epoll_fd_ = -1;
-    }
-
-    for (const auto& [fd, conn] : connections_) {
-        close(fd);
-    }
-    connections_.clear();
     std::println("Server stopped gracefully");
 }
 
-void HttpServer::closeConnection(int fd) {
+void HttpServer::runAcceptor() {
+    std::vector<struct pollfd> pfd(1);
+    pfd[0].fd = server_fd_;
+    pfd[0].events = POLLIN;
+
+    while (running_) {
+        int rc = poll(pfd.data(), 1, 200);
+        if (rc <= 0) {
+            continue;
+        }
+
+        while (running_) {
+            int cfd = accept4(server_fd_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+            if (cfd < 0) {
+                break;  // EAGAIN or transient error; back to poll()
+            }
+
+            uint64_t gen = g_next_gen.fetch_add(1, std::memory_order_relaxed);
+            // Must match ownerOf(): fd % worker_count.
+            Worker& w = *workers_[static_cast<size_t>(cfd) % workers_.size()];
+            {
+                std::lock_guard<std::mutex> lock(w.mu);
+                w.tasks.push_back([this, &w, cfd, gen] {
+                    Connection c;
+                    c.fd = cfd;
+                    c.gen = gen;
+                    c.last_activity = now();
+                    c.next_keep_alive = now() + std::chrono::seconds(kSseKeepAliveSecs);
+                    w.conns.emplace(cfd, std::move(c));
+                    struct epoll_event ev{};
+                    ev.events = EPOLLIN;
+                    ev.data.fd = cfd;
+                    if (epoll_ctl(w.epoll_fd, EPOLL_CTL_ADD, cfd, &ev) < 0) {
+                        std::println(stderr, "epoll ADD failed for fd {}", cfd);
+                        closeConn(w, cfd);
+                    }
+                });
+            }
+            uint64_t one = 1;
+            ssize_t r = write(w.wake_efd, &one, sizeof(one));
+            (void)r;
+        }
+    }
+}
+
+void HttpServer::initWorker(Worker& w) {
+    w.epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    w.wake_efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    w.timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (w.epoll_fd < 0 || w.wake_efd < 0 || w.timer_fd < 0) {
+        std::println(stderr, "[Worker {}] Failed creating epoll/efd/timer", w.idx);
+        std::_Exit(1);
+    }
+
+    itimerspec ts{};
+    ts.it_value.tv_sec = kTimerIntervalMs / 1000;
+    ts.it_interval.tv_sec = kTimerIntervalMs / 1000;
+    timerfd_settime(w.timer_fd, 0, &ts, nullptr);
+
+    struct epoll_event ev{};
+    ev.events = EPOLLIN;
+    ev.data.fd = w.wake_efd;
+    epoll_ctl(w.epoll_fd, EPOLL_CTL_ADD, w.wake_efd, &ev);
+    ev.data.fd = w.timer_fd;
+    epoll_ctl(w.epoll_fd, EPOLL_CTL_ADD, w.timer_fd, &ev);
+}
+
+void HttpServer::processTasks(Worker& w) {
+    std::deque<std::function<void()>> batch;
+    {
+        std::lock_guard<std::mutex> lock(w.mu);
+        batch.swap(w.tasks);
+    }
+    while (!batch.empty()) {
+        auto task = std::move(batch.front());
+        batch.pop_front();
+        task();
+    }
+}
+
+void HttpServer::runWorker(Worker* wp) {
+    Worker& w = *wp;
+    initWorker(w);
+
+    std::vector<struct epoll_event> events(256);
+
+    while (true) {
+        int n = epoll_wait(w.epoll_fd, events.data(), static_cast<int>(events.size()),
+                           running_ ? -1 : 50);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+
+        for (int i = 0; i < n; ++i) {
+            int fd = events[i].data.fd;
+            uint32_t ev = events[i].events;
+
+            if (fd == w.wake_efd) {
+                uint64_t v;
+                while (::read(w.wake_efd, &v, sizeof(v)) > 0) {
+                }
+                processTasks(w);
+            } else if (fd == w.timer_fd) {
+                uint64_t expirations = 0;
+                while (::read(w.timer_fd, &expirations, sizeof(expirations)) > 0) {
+                }
+                onTimerTick(w);
+            } else if (ev & (EPOLLERR | EPOLLHUP)) {
+                closeConn(w, fd);
+            } else {
+                if (ev & EPOLLOUT) {
+                    handleWritable(w, fd);
+                }
+                if (ev & EPOLLIN) {
+                    handleReadable(w, fd);
+                }
+            }
+        }
+
+        processTasks(w);
+
+        if (!running_) {
+            bool idle;
+            {
+                std::lock_guard<std::mutex> lock(w.mu);
+                idle = w.tasks.empty() && w.conns.empty();
+            }
+            if (idle) {
+                break;
+            }
+        }
+    }
+
+    std::vector<int> remaining;
+    {
+        std::lock_guard<std::mutex> lock(w.mu);
+        for (auto& [fd, c] : w.conns)
+            remaining.push_back(fd);
+    }
+    for (int fd : remaining) {
+        closeConn(w, fd);
+    }
+    ::close(w.timer_fd);
+    ::close(w.wake_efd);
+    ::close(w.epoll_fd);
+}
+
+// SSE keep-alives, WS liveness pings, idle sweeps. Owning worker only.
+void HttpServer::onTimerTick(Worker& w) {
+    auto tnow = now();
+    std::vector<int> to_close;
+    for (auto& [fd, c] : w.conns) {
+        if ((c.is_sse || c.is_websocket) && !c.close_after_flush && tnow >= c.next_keep_alive) {
+            c.next_keep_alive = tnow + std::chrono::seconds(kSseKeepAliveSecs);
+            std::string keep =
+                c.is_sse ? EventBus::keepAliveFrame() : WebSocket::encodeFrame("", 0x89);
+            applyOutbound(w, fd, c.gen, std::move(keep), false);
+            continue;
+        }
+        if (!c.is_sse && !c.is_websocket && !c.busy &&
+            elapsedSecs(c.last_activity) >= kIdleTimeoutSecs) {
+            to_close.push_back(fd);
+        }
+    }
+    for (int fd : to_close) {
+        closeConn(w, fd);
+    }
+}
+
+void HttpServer::armOut(Worker& w, Connection& c, bool armed) {
+    if (c.out_armed == armed)
+        return;
+    struct epoll_event ev{};
+    ev.events = armed ? (EPOLLIN | EPOLLOUT) : EPOLLIN;
+    ev.data.fd = c.fd;
+    if (epoll_ctl(w.epoll_fd, EPOLL_CTL_MOD, c.fd, &ev) == 0) {
+        c.out_armed = armed;
+    }
+}
+
+// Flushes pending outbound bytes (owning worker only).
+bool HttpServer::flushOut(Worker& w, Connection& c) {
+    while (c.out_off < c.out_buf.size()) {
+        ssize_t sent =
+            ::send(c.fd, c.out_buf.data() + c.out_off, c.out_buf.size() - c.out_off, MSG_NOSIGNAL);
+        if (sent >= 0) {
+            c.out_off += static_cast<size_t>(sent);
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            armOut(w, c, true);
+            return true;  // pending; resumes on EPOLLOUT
+        }
+        return false;
+    }
+    c.out_buf.clear();
+    c.out_off = 0;
+    armOut(w, c, false);
+    return true;
+}
+
+void HttpServer::applyOutbound(Worker& w, int fd, uint64_t gen, std::string data,
+                               bool close_after) {
+    auto it = w.conns.find(fd);
+    if (it == w.conns.end() || it->second.gen != gen) {
+        return;
+    }
+    Connection& c = it->second;
+
+    if (close_after) {
+        c.close_after_flush = true;
+    }
+
+    // Slow-consumer backpressure: drop connections past the cap.
+    if (!data.empty()) {
+        size_t pending = c.out_buf.size() - c.out_off;
+        if (pending + data.size() > kMaxOutBufBytes) {
+            std::println(stderr, "[Server] Slow consumer on fd {}: output cap reached", fd);
+            closeConn(w, fd);
+            return;
+        }
+        c.out_buf.append(data);
+    }
+
+    if (!flushOut(w, c)) {
+        closeConn(w, fd);
+        return;
+    }
+    if (c.close_after_flush && c.out_off >= c.out_buf.size()) {
+        closeConn(w, fd);
+    }
+}
+
+void HttpServer::closeConn(Worker& w, int fd) {
+    auto it = w.conns.find(fd);
+    if (it == w.conns.end())
+        return;
+
     if (room_registry_) {
-        std::string broadcast_msg;
-        std::vector<int> target_fds;
-        room_registry_->unregisterFd(fd, broadcast_msg, target_fds);
-        if (!broadcast_msg.empty() && !target_fds.empty()) {
-            std::string frame_str = WebSocket::encodeFrame(broadcast_msg, 0x01);
-            for (int target_fd : target_fds) {
-                sendAll(target_fd, frame_str);
+        ConnId left{fd, it->second.gen};
+        std::string msg;
+        std::vector<ConnId> targets;
+        room_registry_->unregisterFd(left, msg, targets);
+        if (!msg.empty() && !targets.empty()) {
+            std::string frame = WebSocket::encodeFrame(msg, 0x01);
+            for (ConnId t : targets) {
+                postTo(t.fd, t.gen, frame, false);
             }
         }
     }
     if (event_bus_) {
         event_bus_->unsubscribeFd(fd);
     }
-    epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
-    close(fd);
-    connections_.erase(fd);
+
+    epoll_ctl(w.epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+    ::close(fd);
+    w.conns.erase(it);
 }
 
-void HttpServer::handleRead(int fd) {
-    auto it = connections_.find(fd);
-    if (it == connections_.end()) {
+void HttpServer::handleReadable(Worker& w, int fd) {
+    auto it = w.conns.find(fd);
+    if (it == w.conns.end())
         return;
-    }
+    Connection& c = it->second;
+    c.last_activity = now();
 
-    char buf[4096];
-    bool close_conn = false;
-    std::string& read_buf = it->second.read_buf;
-
+    char buf[16384];
     while (true) {
-        ssize_t bytes_read = recv(fd, buf, sizeof(buf), 0);
-        if (bytes_read < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                break;
-            }
-            close_conn = true;
-            break;
-        } else if (bytes_read == 0) {
-            close_conn = true;
-            break;
-        }
-        read_buf.append(buf, bytes_read);
-    }
-
-    if (close_conn) {
-        closeConnection(fd);
-        return;
-    }
-
-    if (it->second.is_websocket) {
-        WebSocket::Frame frame;
-        while (WebSocket::parseFrame(read_buf, frame)) {
-            read_buf.erase(0, frame.consumed_bytes);
-            if (frame.opcode == 0x01) {
-                if (room_registry_) {
-                    std::string broadcast_msg;
-                    std::vector<int> target_fds;
-                    room_registry_->handleMessage(fd, frame.payload, broadcast_msg, target_fds);
-                    if (!broadcast_msg.empty() && !target_fds.empty()) {
-                        std::string frame_str = WebSocket::encodeFrame(broadcast_msg, 0x01);
-                        for (int target_fd : target_fds) {
-                            sendAll(target_fd, frame_str);
-                        }
-                    }
-                }
-            } else if (frame.opcode == 0x02) {
-                // Relay binary Yjs CRDT frames to other room participants
-                if (room_registry_) {
-                    auto target_fds = room_registry_->getRelayTargets(fd);
-                    if (!target_fds.empty()) {
-                        std::string bin_frame = WebSocket::encodeFrame(frame.payload, 0x02);
-                        for (int target_fd : target_fds) {
-                            sendAll(target_fd, bin_frame);
-                        }
-                    }
-                }
-            } else if (frame.opcode == 0x08) {
-                closeConnection(fd);
+        ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+        if (n > 0) {
+            c.read_buf.append(buf, static_cast<size_t>(n));
+            if (c.read_buf.size() > kMaxReadBufBytes) {
+                std::println(stderr, "[Server] Read buffer cap exceeded on fd {}", fd);
+                closeConn(w, fd);
                 return;
-            } else if (frame.opcode == 0x09) {
-                std::string pong = WebSocket::encodeFrame(frame.payload, 0x0A);
-                sendAll(fd, pong);
             }
+            continue;
         }
+        if (n == 0) {
+            closeConn(w, fd);
+            return;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            break;
+        closeConn(w, fd);
         return;
     }
 
-    HttpRequest req;
-    size_t bytes_consumed = 0;
-    if (HttpParser::parse(read_buf, req, bytes_consumed)) {
-        HttpResponse res = router_.route(req, fd);
-        std::string res_str = res.toString();
-
-        sendAll(fd, res_str);
-        read_buf.erase(0, bytes_consumed);
-        if (res.is_websocket) {
-            it->second.is_websocket = true;
-            if (room_registry_) {
-                std::string note_id_str = res.headers["X-Note-Id"];
-                std::string user_email = res.headers["X-User-Email"];
-                if (!note_id_str.empty()) {
-                    std::string broadcast_msg;
-                    std::vector<int> target_fds;
-                    room_registry_->joinRoom(note_id_str, fd, req.user_id, user_email,
-                                             broadcast_msg, target_fds);
-                    if (!broadcast_msg.empty() && !target_fds.empty()) {
-                        std::string frame_str = WebSocket::encodeFrame(broadcast_msg, 0x01);
-                        for (int target_fd : target_fds) {
-                            sendAll(target_fd, frame_str);
-                        }
-                    }
-                }
-            }
-        } else if (!res.is_sse) {
-            closeConnection(fd);
-        }
+    if (c.is_websocket) {
+        processWsFrames(w, fd);
+    } else {
+        dispatchRequest(w, c);
     }
 }
 
-bool HttpServer::sendAll(int fd, const std::string& data) {
-    size_t total_sent = 0;
-    while (total_sent < data.size()) {
-        ssize_t sent = send(fd, data.data() + total_sent, data.size() - total_sent, MSG_NOSIGNAL);
-        if (sent < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                struct pollfd pfd;
-                pfd.fd = fd;
-                pfd.events = POLLOUT;
-                int ret = poll(&pfd, 1, 5000);
-                if (ret <= 0) {
-                    return false;
-                }
-                continue;
-            }
-            return false;
-        }
-        total_sent += sent;
+void HttpServer::handleWritable(Worker& w, int fd) {
+    auto it = w.conns.find(fd);
+    if (it == w.conns.end())
+        return;
+    Connection& c = it->second;
+    c.last_activity = now();
+
+    if (!flushOut(w, c)) {
+        closeConn(w, fd);
+        return;
     }
-    return true;
+    if (c.close_after_flush && c.out_off >= c.out_buf.size()) {
+        closeConn(w, fd);
+    }
+}
+
+void HttpServer::dispatchRequest([[maybe_unused]] Worker& w, Connection& c) {
+    // Parse as many pipelined requests as available.
+    while (!c.busy && !c.close_after_flush) {
+        HttpRequest req;
+        size_t consumed = 0;
+        if (!HttpParser::parse(c.read_buf, req, consumed)) {
+            return;
+        }
+        c.read_buf.erase(0, consumed);
+        c.busy = true;
+
+        ConnId id{c.fd, c.gen};
+        blocking_.submit([this, id, req]() mutable {
+            HttpResponse res = router_.route(req);
+            enqueueCompletion(id, std::move(req), std::move(res));
+        });
+    }
+}
+
+void HttpServer::completeResponse(Worker& w, int fd, uint64_t gen, HttpRequest req,
+                                  HttpResponse res) {
+    // Runs as a queued task on the owning worker.
+    auto it = w.conns.find(fd);
+    if (it == w.conns.end() || it->second.gen != gen) {
+        return;
+    }
+    Connection& c = it->second;
+    c.busy = false;
+
+    std::string payload = res.toString();
+    bool keep_open = res.is_sse || res.is_websocket;
+    if (keep_open) {
+        c.is_sse = res.is_sse;
+        c.is_websocket = res.is_websocket;
+        c.next_keep_alive = now() + std::chrono::seconds(kSseKeepAliveSecs);
+    } else {
+        c.close_after_flush = true;
+    }
+    c.out_buf.append(payload);
+
+    if (!flushOut(w, c)) {
+        closeConn(w, fd);
+        return;
+    }
+    if (c.close_after_flush && c.out_off >= c.out_buf.size()) {
+        closeConn(w, fd);
+        return;
+    }
+
+    if (res.is_websocket && room_registry_) {
+        std::string note_id_str = res.headers["X-Note-Id"];
+        std::string user_email = res.headers["X-User-Email"];
+        bool is_editor = res.headers.count("X-Note-Editor") && res.headers["X-Note-Editor"] == "1";
+        if (!note_id_str.empty()) {
+            std::string msg;
+            std::vector<ConnId> targets;
+            room_registry_->joinRoom(note_id_str, ConnId{fd, gen}, req.user_id, user_email,
+                                     is_editor, msg, targets);
+            if (!msg.empty() && !targets.empty()) {
+                std::string frame = WebSocket::encodeFrame(msg, 0x01);
+                for (ConnId t : targets) {
+                    postTo(t.fd, t.gen, frame, false);
+                }
+            }
+        }
+    }
+    if (res.is_sse && event_bus_) {
+        // Subscribe after headers are queued to preserve frame order.
+        event_bus_->subscribe(req.user_id, ConnId{fd, gen});
+    }
+
+    if (!c.read_buf.empty() && !c.busy && !c.close_after_flush) {
+        dispatchRequest(w, c);
+    }
+}
+
+void HttpServer::enqueueCompletion(ConnId id, HttpRequest req, HttpResponse res) {
+    Worker& w = ownerOf(id.fd);
+    {
+        std::lock_guard<std::mutex> lock(w.mu);
+        w.tasks.push_back([this, &w, id, req = std::move(req), res = std::move(res)]() mutable {
+            completeResponse(w, id.fd, id.gen, std::move(req), std::move(res));
+        });
+    }
+    uint64_t one = 1;
+    ssize_t rc = write(w.wake_efd, &one, sizeof(one));
+    (void)rc;
+}
+
+// Decoded WebSocket frames; broadcasts fan out via generation-checked posts.
+void HttpServer::processWsFrames(Worker& w, int fd) {
+    auto it = w.conns.find(fd);
+    if (it == w.conns.end())
+        return;
+    Connection& c = it->second;
+
+    WebSocket::Frame frame;
+    while (WebSocket::parseFrame(c.read_buf, frame)) {
+        c.read_buf.erase(0, frame.consumed_bytes);
+        try {
+            if (frame.opcode == 0x01) {  // JSON control/presence messages
+                if (!room_registry_) {
+                    continue;
+                }
+                std::string msg;
+                std::vector<ConnId> targets;
+                room_registry_->handleMessage(ConnId{fd, c.gen}, frame.payload, msg, targets);
+                if (!msg.empty() && !targets.empty()) {
+                    std::string out = WebSocket::encodeFrame(msg, 0x01);
+                    for (ConnId t : targets) {
+                        postTo(t.fd, t.gen, out, false);
+                    }
+                }
+            } else if (frame.opcode == 0x02) {  // binary Yjs CRDT relay
+                // Viewers must not relay document mutations.
+                if (!room_registry_ || !room_registry_->canRelayBinary(fd)) {
+                    continue;
+                }
+                auto targets = room_registry_->getRelayTargets(fd);
+                if (targets.empty()) {
+                    continue;
+                }
+                std::string out = WebSocket::encodeFrame(frame.payload, 0x02);
+                for (ConnId t : targets) {
+                    postTo(t.fd, t.gen, out, false);
+                }
+            } else if (frame.opcode == 0x08) {  // close
+                closeConn(w, fd);
+                return;
+            } else if (frame.opcode == 0x09) {  // ping -> pong
+                applyOutbound(w, fd, c.gen, WebSocket::encodeFrame(frame.payload, 0x0A), false);
+            }
+        } catch (const std::exception& e) {
+            std::println(stderr, "[WS] Frame handling error on fd {}: {}", fd, e.what());
+        } catch (...) {
+            std::println(stderr, "[WS] Unknown frame handling error on fd {}", fd);
+        }
+        // May have closed while handling.
+        if (w.conns.find(fd) == w.conns.end())
+            return;
+    }
+}
+
+void HttpServer::stop() {
+    if (!running_.exchange(false)) {
+        return;
+    }
+
+    if (server_fd_ >= 0) {
+        ::close(server_fd_);
+        server_fd_ = -1;
+    }
+
+    // Wake all workers so they observe running_ == false and drain.
+    for (auto& w : workers_) {
+        uint64_t one = 1;
+        ssize_t r = write(w->wake_efd, &one, sizeof(one));
+        (void)r;
+    }
 }

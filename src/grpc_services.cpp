@@ -114,9 +114,16 @@ AttachmentServiceImpl::AttachmentServiceImpl(NoteStore& note_store, std::string 
 grpc::Status AttachmentServiceImpl::GenerateUploadUrl(
     grpc::ServerContext*, const notenest::attachment::GenerateUploadUrlRequest* request,
     notenest::attachment::GenerateUploadUrlResponse* response) {
+    // Reject unsafe filenames: no path separators, traversal or control chars.
+    auto safe_name = Utils::sanitizeFilename(request->filename());
+    if (!safe_name) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            "Invalid filename: path separators, traversal sequences and control "
+                            "characters are not allowed");
+    }
+
     std::string att_id = Utils::generateUUID();
-    std::string object_key =
-        "attachments/" + request->note_id() + "/" + att_id + "_" + request->filename();
+    std::string object_key = "attachments/" + request->note_id() + "/" + att_id + "_" + *safe_name;
     std::string bucket = note_store_.getBucketName();
     ObjectStore* os = note_store_.getObjectStore();
     std::string url;
@@ -138,6 +145,21 @@ grpc::Status AttachmentServiceImpl::CompleteUpload(
     if (current_size + request->size_bytes() > max_quota) {
         return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED,
                             "Attachment storage quota exceeded (100MB max)");
+    }
+
+    // Filenames must be safe before they are persisted or used in keys.
+    auto safe_name = Utils::sanitizeFilename(request->filename());
+    if (!safe_name) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            "Invalid filename: path separators, traversal sequences and control "
+                            "characters are not allowed");
+    }
+
+    // Reject completions with mismatched object keys.
+    std::string expected_key =
+        "attachments/" + request->note_id() + "/" + request->attachment_id() + "_" + *safe_name;
+    if (request->object_key() != expected_key) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "Attachment key mismatch");
     }
 
     std::string bucket = note_store_.getBucketName();
