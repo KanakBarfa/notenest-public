@@ -65,3 +65,50 @@ assert_request() {
     echo "Status code: $status_code"
     echo "---"
 }
+
+# Asserts a JSON document contains an exact value at a top-level jq path.
+# Args: json_text, jq_path, expected_value
+assert_json_eq() {
+    local json_text=$1
+    local jq_path=$2
+    local expected=$3
+    local actual
+    actual=$(echo "$json_text" | jq -r "$jq_path")
+    if [ "$actual" != "$expected" ]; then
+        echo "Assertion FAILED: $jq_path expected '$expected', got '$actual'"
+        echo "JSON: $json_text"
+        exit 1
+    fi
+}
+
+# Asserts a string contains a substring; fails otherwise.
+assert_contains() {
+    local haystack=$1
+    local needle=$2
+    case "$haystack" in
+        *"$needle"*) return 0 ;;
+        *)
+            echo "Assertion FAILED: expected to find '$needle' in: ${haystack:0:300}"
+            exit 1
+            ;;
+    esac
+}
+
+# Registers the current suite for guaranteed cleanup on any exit.
+register_cleanup() {
+    trap 'cleanup_db' EXIT
+}
+
+# Waits until the full gateway chain (HAProxy -> Kong -> app) serves health.
+await_gateway() {
+    local code
+    for attempt in {1..30}; do
+        code=$(curl -s -o /dev/null -w "%{http_code}" "$SERVER_URL/health" || echo 000)
+        if [ "$code" -eq 200 ]; then
+            return 0
+        fi
+        sleep 2
+    done
+    echo "FAILED: gateway did not become healthy within 60s"
+    exit 1
+}

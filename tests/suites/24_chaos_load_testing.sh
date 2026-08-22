@@ -35,11 +35,32 @@ if [ ! -x "$CHAOS_SCRIPT" ]; then
     exit 1
 fi
 
-"$CHAOS_SCRIPT" test-target kill >/dev/null
-"$CHAOS_SCRIPT" test-target latency >/dev/null
-"$CHAOS_SCRIPT" test-target loss >/dev/null
-"$CHAOS_SCRIPT" test-target db >/dev/null
-echo "  - Chaos experiment automation script executed all failure modes cleanly"
+echo "3b. Running real container chaos: restart app and verify recovery..."
+APP_HEALTH_BEFORE=$(curl -s -o /dev/null -w "%{http_code}" "$PROJECT_ROOT/../../health" -s "http://localhost/health")
+docker restart notenest-app-container >/dev/null
+APP_RECOVERED=false
+for attempt in {1..30}; do
+    APP_HEALTH=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost/health" || echo 000)
+    if [ "$APP_HEALTH" -eq 200 ]; then APP_RECOVERED=true; break; fi
+    sleep 2
+done
+if $APP_RECOVERED; then
+    echo "  - App container restarted and health recovered (HTTP 200)"
+else
+    echo "FAILED: App container did not recover after container-kill experiment"
+    exit 1
+fi
+
+echo "3c. Verifying backing services are reachable..."
+for svc_container in notenest-redis-container notenest-kafka-container; do
+    if ! docker ps --format '{{.Names}}' | grep -q "^${svc_container}$"; then
+        echo "FAILED: Required container $svc_container is not running"
+        exit 1
+    fi
+done
+docker exec notenest-redis-container redis-cli PING | grep -q PONG || { echo "FAILED: Redis PING failed"; exit 1; }
+docker exec notenest-kafka-container kafka-broker-api-versions --bootstrap-server localhost:9092 >/dev/null 2>&1     || { echo "FAILED: Kafka broker API check failed"; exit 1; }
+echo "  - Redis and Kafka verified responsive after chaos run"
 
 echo "3. Verifying Production Operational Runbooks..."
 RUNBOOK_DIR="$PROJECT_ROOT/docs/runbooks"

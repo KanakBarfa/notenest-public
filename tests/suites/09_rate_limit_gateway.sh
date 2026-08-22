@@ -53,7 +53,8 @@ done
 if $got_429; then
     echo "Rate limiting verified: 429 Too Many Requests returned during rapid burst."
 else
-    echo "Notice: Burst did not trigger 429 in current window."
+    echo "FAILED: Burst of 70 requests did not trigger a single 429 from gateway rate limiting"
+    exit 1
 fi
 
 # Clean up rate limiting keys from Redis after test burst
