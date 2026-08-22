@@ -24,6 +24,9 @@ public:
     // Delete value from Redis.
     void del(const std::string& key) override;
 
+    // Atomically retrieves and deletes a value (GETDEL).
+    std::optional<std::string> getdel(const std::string& key) override;
+
     // Returns active connection count.
     size_t getActiveCount() const;
 

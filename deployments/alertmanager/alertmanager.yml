@@ -6,7 +6,20 @@ route:
   group_wait: 2s
   group_interval: 2s
   repeat_interval: 1h
-  receiver: 'default-receiver'
+  routes:
+    # Critical pages go to the webhook receiver; warnings stay logged only.
+    - match_re:
+        severity: critical
+      receiver: ops-webhook
+    - receiver: default-receiver
+  receiver: default-receiver
 
 receivers:
-  - name: 'default-receiver'
+  - name: default-receiver
+
+  # Stub: replace the URL when wiring Slack/Opsgenie/PagerDuty bridges.
+  # Alertmanager does not interpolate env vars; edit this file directly.
+  - name: ops-webhook
+    webhook_configs:
+      - url: http://alert-bridge:5001/alerts
+        send_resolved: true

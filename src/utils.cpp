@@ -92,6 +92,29 @@ std::optional<std::string> parseUUID(const std::string& id_str) {
     return id_str;
 }
 
+std::optional<std::string> sanitizeFilename(const std::string& name) {
+    constexpr size_t MAX_FILENAME_LENGTH = 255;
+
+    if (name.empty() || name.length() > MAX_FILENAME_LENGTH) {
+        return std::nullopt;
+    }
+    if (name == "." || name == "..") {
+        return std::nullopt;
+    }
+
+    for (unsigned char c : name) {
+        if (c == '/' || c == '\\' || c < 0x20 || c == 0x7F) {
+            return std::nullopt;
+        }
+    }
+
+    if (name.find("..") != std::string::npos) {  // no traversal segments
+        return std::nullopt;
+    }
+
+    return name;
+}
+
 std::string urlEncode(const std::string& str) {
     std::stringstream ss;
     for (unsigned char c : str) {

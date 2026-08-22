@@ -14,13 +14,40 @@
 using json = nlohmann::json;
 
 Router::Router(NoteStore& store, AuthService& auth_service, EventBus* event_bus,
-               RoomRegistry* room_registry, AuthGrpcClient* auth_grpc_client)
+               RoomRegistry* room_registry, AuthGrpcClient* auth_grpc_client, Cache* cache)
     : store_(store),
       auth_service_(auth_service),
       auth_grpc_client_(auth_grpc_client),
-      auth_middleware_(auth_service),
+      auth_middleware_(auth_service, cache),
+      cache_(cache),
       event_bus_(event_bus),
       room_registry_(room_registry) {}
+
+namespace {
+
+// Extracts a named parameter from the request query string.
+std::string extractQueryParam(const std::string& path, const std::string& name) {
+    size_t qpos = path.find('?');
+    if (qpos == std::string::npos)
+        return "";
+    std::string query = path.substr(qpos + 1);
+    std::string prefix = name + "=";
+    size_t start = 0;
+    while (start <= query.size()) {
+        size_t amp = query.find('&', start);
+        std::string pair =
+            query.substr(start, amp == std::string::npos ? std::string::npos : amp - start);
+        if (pair.rfind(prefix, 0) == 0) {
+            return pair.substr(prefix.size());
+        }
+        if (amp == std::string::npos)
+            break;
+        start = amp + 1;
+    }
+    return "";
+}
+
+}  // namespace
 
 // Helper to create a JSON error response.
 static HttpResponse makeErrorResponse(int status, const std::string& status_text,
@@ -33,7 +60,7 @@ static HttpResponse makeErrorResponse(int status, const std::string& status_text
     return res;
 }
 
-HttpResponse Router::route(HttpRequest& req, int fd) const {
+HttpResponse Router::route(HttpRequest& req) const {
     if (req.method == HttpMethod::OPTIONS) {
         HttpResponse res;
         res.status_code = 204;
@@ -58,7 +85,7 @@ HttpResponse Router::route(HttpRequest& req, int fd) const {
 
     HttpResponse res;
     try {
-        res = routeInternal(req, fd);
+        res = routeInternal(req);
     } catch (const std::exception& e) {
         std::println(stderr, "[Router] Handler exception: {}", e.what());
         res = makeErrorResponse(503, "Service Unavailable", e.what());
@@ -86,18 +113,20 @@ HttpResponse Router::route(HttpRequest& req, int fd) const {
     else if (req.method == HttpMethod::DELETE)
         method_str = "DELETE";
 
-    Observability::getInstance().incRequest(method_str, req.path, res.status_code);
+    // Keep credentials/tickets out of logs and metric labels.
+    std::string metrics_path = req.path.substr(0, req.path.find('?'));
+    Observability::getInstance().incRequest(method_str, metrics_path, res.status_code);
     Observability::getInstance().observeDuration(method_str, duration);
-    Observability::logJson("INFO",
-                           method_str + " " + req.path + " HTTP " + std::to_string(res.status_code),
-                           trace_id, span_id);
-    Observability::sendOtlpSpan(method_str + " " + req.path, trace_id, span_id, parent_id, start_ns,
-                                end_ns);
+    Observability::logJson(
+        "INFO", method_str + " " + metrics_path + " HTTP " + std::to_string(res.status_code),
+        trace_id, span_id);
+    Observability::sendOtlpSpan(method_str + " " + metrics_path, trace_id, span_id, parent_id,
+                                start_ns, end_ns);
 
     return res;
 }
 
-HttpResponse Router::routeInternal(HttpRequest& req, int fd) const {
+HttpResponse Router::routeInternal(HttpRequest& req) const {
     if (req.method == HttpMethod::UNKNOWN) {
         return makeErrorResponse(400, "Bad Request", "Unknown HTTP method");
     }
@@ -117,6 +146,16 @@ HttpResponse Router::routeInternal(HttpRequest& req, int fd) const {
         res.status_text = "OK";
         res.headers["Content-Type"] = "text/plain; version=0.0.4";
         res.body = Observability::getInstance().renderMetrics();
+        return res;
+    }
+
+    // Public liveness probe for load balancers and orchestrators.
+    if (clean_path == "/health" || clean_path == "/health/") {
+        HttpResponse res;
+        res.status_code = 200;
+        res.status_text = "OK";
+        res.headers["Content-Type"] = "application/json";
+        res.body = "{\"status\":\"healthy\"}";
         return res;
     }
 
@@ -143,16 +182,53 @@ HttpResponse Router::routeInternal(HttpRequest& req, int fd) const {
         }
     }
 
+    if (clean_path == "/logout" || clean_path == "/logout/") {
+        if (req.method == HttpMethod::POST) {
+            return handleLogout(req);
+        } else {
+            HttpResponse res =
+                makeErrorResponse(405, "Method Not Allowed", "Method not allowed on /logout");
+            res.headers["Allow"] = "POST";
+            return res;
+        }
+    }
+
+    // Realtime endpoints also accept one-time tickets.
+    bool realtime_path =
+        clean_path == "/events" || clean_path == "/events/" ||
+        (clean_path.size() >= 4 && clean_path.compare(clean_path.size() - 3, 3, "/ws") == 0);
+
     // Protected routes require authentication
     auto user_id_opt = auth_middleware_.authenticate(req);
+    if (!user_id_opt && realtime_path) {
+        std::string ticket = extractQueryParam(req.path, "ticket");
+        if (!ticket.empty() && cache_) {
+            auto redeemed = cache_->getdel("rt:ticket:" + ticket);
+            if (redeemed && !redeemed->empty()) {
+                user_id_opt = *redeemed;
+            }
+        }
+    }
     if (!user_id_opt) {
         return makeErrorResponse(401, "Unauthorized", "Unauthorized");
     }
     req.user_id = *user_id_opt;
 
+    // One-time ticket for SSE/WS; Bearer auth only.
+    if (clean_path == "/realtime/ticket" || clean_path == "/realtime/ticket/") {
+        if (req.method == HttpMethod::POST) {
+            return handleRealtimeTicket(req.user_id);
+        } else {
+            HttpResponse res = makeErrorResponse(405, "Method Not Allowed",
+                                                 "Method not allowed on /realtime/ticket");
+            res.headers["Allow"] = "POST";
+            return res;
+        }
+    }
+
     if (clean_path == "/events" || clean_path == "/events/") {
         if (req.method == HttpMethod::GET) {
-            return handleEvents(req, fd);
+            return handleEvents(req);
         } else {
             HttpResponse res =
                 makeErrorResponse(405, "Method Not Allowed", "Method not allowed on /events");
@@ -265,7 +341,7 @@ HttpResponse Router::routeInternal(HttpRequest& req, int fd) const {
                 }
             } else if (suffix == "/ws" || suffix == "/ws/") {
                 if (req.method == HttpMethod::GET) {
-                    return handleNoteWebSocket(id_str, req, fd);
+                    return handleNoteWebSocket(id_str, req);
                 } else {
                     HttpResponse res =
                         makeErrorResponse(405, "Method Not Allowed", "Method not allowed on /ws");
@@ -512,6 +588,15 @@ HttpResponse Router::handlePostAttachment(const std::string& note_id, const std:
         filename = j["filename"].get<std::string>();
     }
 
+    // Reject unsafe filenames: no path separators, traversal or control chars.
+    auto safe_name = Utils::sanitizeFilename(filename);
+    if (!safe_name) {
+        return makeErrorResponse(400, "Bad Request",
+                                 "Invalid filename: path separators, traversal sequences and "
+                                 "control characters are not allowed");
+    }
+    filename = *safe_name;
+
     std::string attachment_id = Utils::generateUUID();
     std::string key = note_id + "/" + attachment_id + "_" + filename;
 
@@ -553,6 +638,20 @@ HttpResponse Router::handleCompleteAttachment(const std::string& note_id, const 
     std::string key = j["key"].get<std::string>();
     std::string filename = j["filename"].get<std::string>();
     long long size = j["size"].get<long long>();
+
+    auto safe_name = Utils::sanitizeFilename(filename);
+    if (!safe_name) {
+        return makeErrorResponse(400, "Bad Request",
+                                 "Invalid filename: path separators, traversal sequences and "
+                                 "control characters are not allowed");
+    }
+    filename = *safe_name;
+
+    // Reject completions whose bytes live at an attacker-chosen key.
+    std::string expected_key = note_id + "/" + attachment_id + "_" + filename;
+    if (key != expected_key) {
+        return makeErrorResponse(400, "Bad Request", "Attachment key mismatch");
+    }
 
     constexpr long long MAX_USER_ATTACHMENT_QUOTA = 100LL * 1024LL * 1024LL;
     long long current_total_size = store_.getTotalAttachmentSizeForUser(owner_id);
@@ -597,11 +696,61 @@ HttpResponse Router::handleDeleteAttachment(const std::string& note_id,
     return res;
 }
 
-HttpResponse Router::handleEvents(HttpRequest& req, int fd) const {
-    if (event_bus_ && fd >= 0) {
-        event_bus_->subscribe(req.user_id, fd);
+HttpResponse Router::handleLogout(const HttpRequest& req) const {
+    std::string token;
+    auto auth_it = req.headers.find("authorization");
+    if (auth_it != req.headers.end() && auth_it->second.rfind("Bearer ", 0) == 0) {
+        token = auth_it->second.substr(7);
     }
 
+    auto claims = Crypto::verifyTokenClaims(token, auth_service_.getSecret());
+    if (!claims || claims->jti.empty()) {
+        HttpResponse res;
+        res.status_code = 200;
+        res.status_text = "OK";
+        res.headers["Content-Type"] = "application/json";
+        res.body = json{{"status", "logged_out"}}.dump();
+        return res;
+    }
+
+    if (cache_) {
+        long long ttl = claims->exp - std::chrono::duration_cast<std::chrono::seconds>(
+                                          std::chrono::system_clock::now().time_since_epoch())
+                                          .count();
+        if (ttl > 0) {
+            cache_->set(std::string("jwt:denylist:") + claims->jti, "1",
+                        static_cast<int>(ttl) + 60);  // clock-skew margin
+        }
+    }
+
+    HttpResponse res;
+    res.status_code = 200;
+    res.status_text = "OK";
+    res.headers["Content-Type"] = "application/json";
+    res.body = json{{"status", "logged_out"}}.dump();
+    return res;
+}
+
+HttpResponse Router::handleRealtimeTicket(const std::string& user_id) const {
+    if (!cache_) {
+        return makeErrorResponse(503, "Service Unavailable", "Ticket store unavailable");
+    }
+
+    std::string ticket = Crypto::randomHex(32);
+    constexpr int TICKET_TTL_SECONDS = 30;
+    cache_->set("rt:ticket:" + ticket, user_id, TICKET_TTL_SECONDS);
+
+    HttpResponse res;
+    res.status_code = 200;
+    res.status_text = "OK";
+    res.headers["Content-Type"] = "application/json";
+    res.body =
+        json{{"ticket", ticket}, {"expires_in", TICKET_TTL_SECONDS}, {"token_type", "ticket"}}
+            .dump();
+    return res;
+}
+
+HttpResponse Router::handleEvents([[maybe_unused]] HttpRequest& req) const {
     HttpResponse res;
     res.status_code = 200;
     res.status_text = "OK";
@@ -731,8 +880,7 @@ HttpResponse Router::handleDeleteNoteShare(const std::string& note_id,
     return res;
 }
 
-HttpResponse Router::handleNoteWebSocket(const std::string& note_id, HttpRequest& req,
-                                         [[maybe_unused]] int fd) const {
+HttpResponse Router::handleNoteWebSocket(const std::string& note_id, HttpRequest& req) const {
     auto id_opt = Utils::parseUUID(note_id);
     if (!id_opt) {
         return makeErrorResponse(400, "Bad Request", "Invalid note ID format");
@@ -775,6 +923,9 @@ HttpResponse Router::handleNoteWebSocket(const std::string& note_id, HttpRequest
     res.headers["Sec-WebSocket-Accept"] = accept_key;
     res.headers["X-Note-Id"] = note_id;
     res.headers["X-User-Email"] = user_email;
+    // Snapshotted at join; registry denies relays from viewers.
+    bool is_editor = note_opt->permission == "owner" || note_opt->permission == "editor";
+    res.headers["X-Note-Editor"] = is_editor ? "1" : "0";
     res.is_websocket = true;
     return res;
 }

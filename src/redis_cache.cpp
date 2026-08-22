@@ -105,6 +105,38 @@ void RedisCache::del(const std::string& key) {
     }
 }
 
+std::optional<std::string> RedisCache::getdel(const std::string& key) {
+    try {
+        PoolGuard<redisContext> guard(*pool_);
+        redisContext* ctx = guard.get();
+        if (!ctx)
+            return std::nullopt;
+
+        // Atomic single-use redemption (Redis >= 6.2).
+        redisReply* reply = (redisReply*)redisCommand(ctx, "GETDEL %s", key.c_str());
+        if (!reply) {
+            pool_->recordFailure();
+            return std::nullopt;
+        }
+
+        std::optional<std::string> result = std::nullopt;
+        if (reply->type == REDIS_REPLY_STRING) {
+            result = std::string(reply->str, reply->len);
+        } else if (reply->type == REDIS_REPLY_ERROR &&
+                   std::string(reply->str).find("unknown command") != std::string::npos) {
+            freeReplyObject(reply);
+            result = get(key);
+            del(key);
+            return result;
+        }
+        freeReplyObject(reply);
+        return result;
+    } catch (const std::exception& e) {
+        std::println(stderr, "[RedisCache] GETDEL failed: {}", e.what());
+        return std::nullopt;
+    }
+}
+
 size_t RedisCache::getActiveCount() const {
     return pool_ ? pool_->getActiveCount() : 0;
 }

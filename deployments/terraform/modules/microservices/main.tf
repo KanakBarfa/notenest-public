@@ -33,7 +33,7 @@ resource "docker_container" "auth" {
     "DB_NAME=postgres",
     "DB_USER=postgres",
     "DB_PASSWORD=pass",
-    "JWT_SECRET=default_super_secure_jwt_secret_key_12345_67890",
+    "JWT_SECRET=${var.jwt_secret}",
     "CONSUL_HOST=${var.consul_container_name}",
     "CONSUL_PORT=8500"
   ]
@@ -108,7 +108,7 @@ resource "docker_container" "graphql" {
     "DB_NAME=postgres",
     "DB_USER=postgres",
     "DB_PASSWORD=pass",
-    "JWT_SECRET=default_super_secure_jwt_secret_key_12345_67890",
+    "JWT_SECRET=${var.jwt_secret}",
     "CONSUL_HOST=${var.consul_container_name}",
     "CONSUL_PORT=8500"
   ]

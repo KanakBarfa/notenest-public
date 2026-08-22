@@ -43,3 +43,8 @@ variable "app_network_name" {
   type        = string
   description = "App network name for service-to-service communication"
 }
+
+variable "jwt_secret" {
+  description = "Generated JWT signing secret shared by all services"
+  type        = string
+}

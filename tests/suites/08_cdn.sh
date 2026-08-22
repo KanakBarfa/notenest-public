@@ -80,8 +80,18 @@ if [ "$cache_status_1" != "MISS" ] && [ "$cache_status_1" != "EXPIRED" ]; then
     exit 1
 fi
 
-if [[ "$cache_control_1" != *"public"* || "$cache_control_1" != *"max-age"* ]]; then
-    echo "Assertion FAILED: Missing or invalid Cache-Control header. Got: '$cache_control_1'"
+# Private attachments must never be reusable by shared caches.
+if [[ "$cache_control_1" != *"private"* || "$cache_control_1" != *"max-age"* ]]; then
+    echo "Assertion FAILED: Expected private Cache-Control on attachment, got: '$cache_control_1'"
+    exit 1
+fi
+
+# Different query strings must map to different cache entries.
+sig_b_url="${get_att_url}&X-Cache-Probe=different-signature"
+cache_status_alt=$(curl -s -o /dev/null -w "%{http_code} %{header_json}" "$sig_b_url" >/dev/null 2>&1; curl -s -D - -o /dev/null "$sig_b_url" | grep -i "^x-cache-status:" | awk '{print $2}' | tr -d '\r\n')
+echo "Alt-signature request X-Cache-Status: '$cache_status_alt'"
+if [ "$cache_status_alt" == "HIT" ]; then
+    echo "Assertion FAILED: Different query string produced a cache HIT (presign bypass!)"
     exit 1
 fi
 
@@ -91,22 +101,22 @@ if [ "$body_1" != "$filecontent" ]; then
 fi
 echo "1st Request verified: Cache MISS with valid Cache-Control header."
 
-# Request 2: Expect Cache Hit (X-Cache-Status: HIT)
+# Private attachments must never be served from the shared edge cache.
 headers_2=$(curl -s -i "$get_att_url")
 cache_status_2=$(echo "$headers_2" | grep -i "^x-cache-status:" | awk '{print $2}' | tr -d '\r\n')
 body_2=$(echo "$headers_2" | sed '1,/^\r\{0,1\}$/d')
 
 echo "2nd Request X-Cache-Status: '$cache_status_2'"
-if [ "$cache_status_2" != "HIT" ]; then
-    echo "Assertion FAILED: Expected 2nd request X-Cache-Status to be HIT, got '$cache_status_2'"
+if [ "$cache_status_2" == "HIT" ]; then
+    echo "Assertion FAILED: Private attachment served from shared CDN cache (must never HIT)"
     exit 1
 fi
 
 if [ "$body_2" != "$filecontent" ]; then
-    echo "Assertion FAILED: 2nd request body content mismatch on Cache HIT!"
+    echo "Assertion FAILED: 2nd request body content mismatch!"
     exit 1
 fi
-echo "2nd Request verified: Cache HIT with correct cached content."
+echo "2nd Request verified: private attachment not shared-cached, content still served."
 
 # Request 3: Cache Bypass test using X-Purge-Cache header
 headers_3=$(curl -s -i -H "X-Purge-Cache: 1" "$get_att_url")

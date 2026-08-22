@@ -5,6 +5,11 @@ services:
   - name: notenest-backend
     url: http://app:8080
     routes:
+      - name: health
+        paths:
+          - /health
+        strip_path: false
+
       - name: public-signup
         paths:
           - /signup
@@ -33,20 +38,26 @@ services:
               fault_tolerant: true
               hide_client_headers: false
 
+      - name: protected-auth-actions
+        paths:
+          - /logout
+          - /realtime
+        strip_path: false
+        plugins:
+          - name: rate-limiting
+            config:
+              minute: 120
+              policy: redis
+              redis_host: redis
+              redis_port: 6379
+              fault_tolerant: true
+              hide_client_headers: false
+
       - name: protected-notes
         paths:
           - /notes
         strip_path: false
         plugins:
-          - name: jwt
-            config:
-              secret_is_base64: false
-              key_claim_name: iss
-              uri_param_names:
-                - token
-                - jwt
-                - access_token
-              run_on_preflight: false
           - name: rate-limiting
             config:
               minute: 600
@@ -62,15 +73,6 @@ services:
           - /events
         strip_path: false
         plugins:
-          - name: jwt
-            config:
-              secret_is_base64: false
-              key_claim_name: iss
-              uri_param_names:
-                - token
-                - jwt
-                - access_token
-              run_on_preflight: false
 
   - name: notenest-graphql
     url: http://graphql:4000
@@ -80,15 +82,6 @@ services:
           - /graphql
         strip_path: false
         plugins:
-          - name: jwt
-            config:
-              secret_is_base64: false
-              key_claim_name: iss
-              uri_param_names:
-                - token
-                - jwt
-                - access_token
-              run_on_preflight: false
           - name: rate-limiting
             config:
               minute: 600
@@ -99,9 +92,4 @@ services:
               fault_tolerant: true
               hide_client_headers: false
 
-consumers:
-  - username: notenest-app
-    jwt_secrets:
-      - key: notenest
-        secret: default_super_secure_jwt_secret_key_12345_67890
-        algorithm: HS256
+# JWT validation happens at the app layer; Kong provides rate limiting only.

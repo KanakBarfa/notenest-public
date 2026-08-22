@@ -24,42 +24,57 @@ function App() {
     }
   }, [token]);
 
-  // Connect to Server-Sent Events stream for real-time notifications
+  // SSE via one-time ticket; EventSource cannot send headers.
   useEffect(() => {
     if (!token) return;
 
     let eventSource = null;
-    try {
-      eventSource = new EventSource(`/api/events?token=${encodeURIComponent(token)}`);
+    let cancelled = false;
 
-      eventSource.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          if (data.type === 'note_shared') {
-            const newNotif = {
-              id: Date.now() + Math.random(),
-              title: data.title || 'Shared Note',
-              senderEmail: data.sender_email || 'A user',
-              noteId: data.note_id,
-              date: new Date(),
-              read: false,
-            };
-            setNotifications((prev) => [newNotif, ...prev]);
-            fetchNotes(token);
+    const connect = async () => {
+      try {
+        const ticketRes = await fetch('/api/realtime/ticket', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${token}` },
+        });
+        if (!ticketRes.ok || cancelled) return;
+        const { ticket } = await ticketRes.json();
+        if (!ticket || cancelled) return;
+
+        eventSource = new EventSource(`/api/events?ticket=${encodeURIComponent(ticket)}`);
+
+        eventSource.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.type === 'note_shared') {
+              const newNotif = {
+                id: Date.now() + Math.random(),
+                title: data.title || 'Shared Note',
+                senderEmail: data.sender_email || 'A user',
+                noteId: data.note_id,
+                date: new Date(),
+                read: false,
+              };
+              setNotifications((prev) => [newNotif, ...prev]);
+              fetchNotes(token);
+            }
+          } catch (err) {
+            console.error('Error parsing SSE event data:', err);
           }
-        } catch (err) {
-          console.error('Error parsing SSE event data:', err);
-        }
-      };
+        };
 
-      eventSource.onerror = (err) => {
-        console.warn('SSE connection error:', err);
-      };
-    } catch (err) {
-      console.error('Failed to create EventSource connection:', err);
-    }
+        eventSource.onerror = (err) => {
+          console.warn('SSE connection error:', err);
+        };
+      } catch (err) {
+        console.error('Failed to create EventSource connection:', err);
+      }
+    };
+
+    connect();
 
     return () => {
+      cancelled = true;
       if (eventSource) {
         eventSource.close();
       }

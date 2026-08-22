@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { marked } from 'marked';
+import DOMPurify from 'dompurify';
 import * as Y from 'yjs';
 import { yCollab, yUndoManagerKeymap } from 'y-codemirror.next';
 import { EditorView, basicSetup } from 'codemirror';
@@ -295,13 +296,27 @@ export default function NoteEditor({ note, token, userEmail, onSaveNote, onRefre
     };
     awareness.on('update', awarenessUpdateHandler);
     
-    // WebSocket connection with auto-reconnect
-    const connect = () => {
+    // Auto-reconnect with a fresh one-time ticket per attempt.
+    const connect = async () => {
       if (!isMounted) return;
+      
+      let ticket;
+      try {
+        const ticketRes = await fetch('/api/realtime/ticket', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${token}` },
+        });
+        if (!ticketRes.ok) return;
+        ({ ticket } = await ticketRes.json());
+      } catch (err) {
+        console.warn('Failed to obtain realtime ticket:', err);
+        return;
+      }
+      if (!isMounted || !ticket) return;
       
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const host = window.location.host;
-      const wsUrl = `${protocol}//${host}/api/notes/${note.id}/ws?token=${encodeURIComponent(token)}`;
+      const wsUrl = `${protocol}//${host}/api/notes/${note.id}/ws?ticket=${encodeURIComponent(ticket)}`;
       
       ws = new WebSocket(wsUrl);
       ws.binaryType = 'arraybuffer';
@@ -673,7 +688,9 @@ export default function NoteEditor({ note, token, userEmail, onSaveNote, onRefre
   const renderMarkdown = (text) => {
     if (!text) return '<p style="color: var(--text-muted)">Nothing to preview</p>';
     try {
-      return marked.parse(text, { gfm: true, breaks: true });
+      // marked output is user-controlled HTML; sanitize before injecting.
+      const rendered = marked.parse(text, { gfm: true, breaks: true });
+      return DOMPurify.sanitize(rendered, { USE_PROFILES: { html: true } });
     } catch (err) {
       console.error(err);
       return '<p style="color: var(--error)">Error rendering markdown</p>';

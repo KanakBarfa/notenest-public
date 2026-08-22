@@ -36,7 +36,7 @@ resource "docker_container" "app" {
     "MINIO_BUCKET=notenest-attachments",
     "MINIO_EXTERNAL_ENDPOINT=http://localhost:9000",
     "KAFKA_BROKERS=${var.kafka_container_name}:9092",
-    "JWT_SECRET=default_super_secure_jwt_secret_key_12345_67890",
+    "JWT_SECRET=${var.jwt_secret}",
     "CONSUL_HOST=notenest-dev-consul",
     "CONSUL_PORT=8500"
   ]

@@ -4,6 +4,7 @@ import sys
 import json
 import struct
 import urllib.parse
+import urllib.request
 import argparse
 import time
 
@@ -34,9 +35,24 @@ class WSConnection:
             data.extend(chunk)
         return bytes(data)
 
+def fetch_ws_ticket(base_url, token):
+    """Exchanges a JWT for a single-use realtime ticket (WS cannot set headers)."""
+    req = urllib.request.Request(
+        f"{base_url.rstrip('/')}/realtime/ticket",
+        method="POST",
+        headers={"Authorization": f"Bearer {token}"},
+        data=b"",
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode())["ticket"]
+
+
 def connect_ws(host, port, parsed_path, note_id, token, timeout=10.0):
     base_path = f"{parsed_path}/notes/{note_id}/ws".replace("//", "/")
-    path = f"{base_path}?token={token}"
+    scheme = "http" if port not in (443,) else "https"
+    base_url = f"{scheme}://{host}:{port}" if port not in (80, 443) else f"{scheme}://{host}"
+    ticket = fetch_ws_ticket(base_url + parsed_path, token)
+    path = f"{base_path}?ticket={urllib.parse.quote(ticket)}"
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:

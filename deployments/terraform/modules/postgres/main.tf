@@ -20,6 +20,15 @@ resource "docker_container" "postgres" {
   name  = var.container_name
   image = docker_image.postgres.image_id
 
+  # wal_level=replica keeps parity with docker-compose and enables standbys.
+  command = [
+    "postgres",
+    "-c", "wal_level=replica",
+    "-c", "max_wal_senders=10",
+    "-c", "max_replication_slots=10",
+    "-c", "hot_standby=on"
+  ]
+
   env = [
     "POSTGRES_USER=${var.postgres_user}",
     "POSTGRES_PASSWORD=${var.postgres_password}",
@@ -44,7 +53,7 @@ resource "docker_container" "postgres" {
   }
 
   volumes {
-    host_path      = abspath("${path.cwd}/../../db/migrations")
+    host_path      = abspath("${path.cwd}/../../db/initdb")
     container_path = "/docker-entrypoint-initdb.d"
   }
 }

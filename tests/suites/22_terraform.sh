@@ -97,7 +97,16 @@ trap cleanup EXIT
 
 echo "6. Planning Terraform provisioning..."
 for svc in auth user graphql notification app nginx; do
-    IMG=$(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -i -E "(^|/|_|-)${svc}(-|/|_|$)" | head -n 1 || true)
+    # Prefer exact repository matches (compose prefixes image names with the
+    # project directory); fall back to the historical generic patterns.
+    IMG=""
+    for cand in "notenest-public-${svc}" "${svc}" "notenest-${svc}"; do
+        IMG=$(docker images --format '{{.Repository}}:{{.Tag}}' "$cand" 2>/dev/null | head -n 1 || true)
+        [ -n "$IMG" ] && break
+    done
+    if [ -z "$IMG" ]; then
+        IMG=$(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -i -E "(^|/|_|-)${svc}(-|/|_|$)" | head -n 1 || true)
+    fi
     if [ -n "$IMG" ]; then
         docker tag "$IMG" "notenest-${svc}:latest" 2>/dev/null || true
     elif [ -n "$(docker images -q notenest:latest 2>/dev/null)" ]; then

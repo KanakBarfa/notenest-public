@@ -1,3 +1,6 @@
+#include <sys/eventfd.h>
+#include <unistd.h>
+
 #include <csignal>
 #include <cstdlib>
 #include <exception>
@@ -18,14 +21,28 @@
 #include <notenest/router.hpp>
 #include <notenest/user_repo.hpp>
 #include <print>
+#include <string_view>
 #include <thread>
 
 static std::unique_ptr<HttpServer> g_server = nullptr;
 static std::unique_ptr<ConsulClient> g_consul_client = nullptr;
+// Signal-safe wakeup for the shutdown monitor thread.
+static int g_shutdown_efd = -1;
 
-// Signal handler for graceful shutdown.
+// Async-signal-safe: write only.
 void signalHandler(int signum) {
-    std::println("\nReceived signal {}, shutting down...", signum);
+    uint64_t one = 1;
+    ssize_t rc = write(g_shutdown_efd, &one, sizeof(one));
+    (void)rc;
+    (void)signum;
+}
+
+void shutdownMonitor() {
+    uint64_t val = 0;
+    if (read(g_shutdown_efd, &val, sizeof(val)) < 0) {
+        return;
+    }
+    std::println("\nShutdown requested, draining connections...");
     if (g_consul_client) {
         g_consul_client->stopHeartbeat();
         g_consul_client->deregisterAllServices();
@@ -37,6 +54,14 @@ void signalHandler(int signum) {
 
 int main() {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
+
+    g_shutdown_efd = eventfd(0, EFD_CLOEXEC);
+    if (g_shutdown_efd < 0) {
+        std::println(stderr, "eventfd creation failed");
+        return 1;
+    }
+    std::thread monitor(shutdownMonitor);
+
     std::signal(SIGINT, signalHandler);
     std::signal(SIGTERM, signalHandler);
     std::signal(SIGPIPE, SIG_IGN);
@@ -103,7 +128,15 @@ int main() {
     }
 
     const char* jwt_env = std::getenv("JWT_SECRET");
-    std::string jwt_secret = jwt_env ? jwt_env : "default_super_secure_jwt_secret_key_12345_67890";
+    if (!jwt_env || std::string(jwt_env).empty() ||
+        jwt_env == std::string_view("default_super_secure_jwt_secret_key_12345_67890")) {
+        std::println(stderr,
+                     "FATAL: JWT_SECRET is missing, empty, or a known insecure default. "
+                     "Set a strong random value (e.g. `make setup` or openssl rand -hex 64) "
+                     "and restart.");
+        return 1;
+    }
+    std::string jwt_secret = jwt_env;
 
     PgUserRepository user_repo;
     AuthService auth_service(user_repo, jwt_secret);
@@ -145,7 +178,6 @@ int main() {
     }
 
     EventBus event_bus;
-    event_bus.startHeartbeat(15);
 
     RoomRegistry room_registry;
 
@@ -176,18 +208,18 @@ int main() {
     std::string auth_service_url = auth_url_env ? auth_url_env : "localhost:50051";
     AuthGrpcClient auth_grpc_client(auth_service_url);
 
-    Router router(store, auth_service, &event_bus, &room_registry, &auth_grpc_client);
+    Router router(store, auth_service, &event_bus, &room_registry, &auth_grpc_client, &redis_cache);
     g_server = std::make_unique<HttpServer>(8080, router, &event_bus, &room_registry);
 
     g_server->start();
 
+    monitor.join();
     if (g_consul_client) {
         g_consul_client->stopHeartbeat();
         g_consul_client->deregisterAllServices();
     }
     outbox_relay.stop();
     grpc_runner.stop();
-    event_bus.stopHeartbeat();
     DBPool::getInstance().close();
     return 0;
 }

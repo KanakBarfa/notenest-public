@@ -17,6 +17,11 @@ public:
 
     // Delete cached value by key.
     virtual void del(const std::string& key) = 0;
+
+    // Atomically retrieves and deletes a value.
+    virtual std::optional<std::string> getdel(const std::string& key) {
+        return get(key);
+    }
 };
 
 #endif

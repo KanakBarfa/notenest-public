@@ -124,8 +124,17 @@ module "consul" {
   host_port         = local.is_test ? 0 : 8500
 }
 
+resource "terraform_data" "jwt_seed" {
+  input = uuid()
+
+  lifecycle {
+    ignore_changes = [input]
+  }
+}
+
 module "microservices" {
   source                  = "./modules/microservices"
+  jwt_secret              = sha256(terraform_data.jwt_seed.input)
   prefix                  = local.prefix
   network_name            = docker_network.tf_network.name
   app_network_name        = docker_network.app_net.name
@@ -150,6 +159,7 @@ module "auxiliary" {
 
 module "app" {
   source                  = "./modules/app"
+  jwt_secret              = sha256(terraform_data.jwt_seed.input)
   container_name          = local.is_test ? "${local.prefix}-app" : "notenest-app-container"
   nginx_container_name    = local.is_test ? "${local.prefix}-nginx" : "notenest-nginx-container"
   network_name            = docker_network.tf_network.name

@@ -146,6 +146,29 @@ sequenceDiagram
 
 Authentication uses Argon2id password hashing and OpenSSL HMAC-SHA256 JWT tokens offloaded to Kong API Gateway. Ingress traffic is checked against Redis rate-limiting counters. Note queries follow the **Cache-Aside** pattern with key-level locking for stampede protection.
 
+### Event-Loop Model & HTTP Parser Hardening
+
+The application serves HTTP on a single-threaded `epoll` event loop (`HttpServer`). All socket writes are funneled through a per-connection task queue guarded by a **generation counter**: any queued write whose connection was closed (or whose fd was reused) is discarded via its stale generation, eliminating use-after-close races between async completions and disconnects.
+
+Request framing is strict by design:
+
+| Guard | Value | Behavior |
+|---|---|---|
+| Content-Length validation | strict | A request carrying both `Content-Length` and chunked encoding, duplicate/conflicting `Content-Length` headers, or non-numeric lengths is rejected with `400` before routing (request-smuggling defense). |
+| Header section cap | 16 KiB | Headers exceeding the cap abort the connection (`431`/close) instead of buffering unboundedly. |
+| Body cap | 8 MiB | Declared or received bodies beyond the cap are rejected. |
+| Request deadline | 20 s | Partial/slow requests that never complete are closed server-side (slowloris containment). |
+| Idle keep-alive timeout | 180 s | Idle keep-alive connections are reaped; SSE streams are exempt via their own 15 s keep-alive comment frames. |
+
+### Secret Requirements
+
+The app **refuses to boot** when `JWT_SECRET` is missing, empty, or set to a known insecure default; it exits non-startup with a fatal message rather than serving tokens signed with guessable material. Secrets are provisioned as generated values, never hardcoded:
+
+- Local/dev: `make setup` writes a fresh `openssl rand -hex 64` value into `.env`.
+- Terraform: the microservices module generates a 64-character `random_password` per apply and injects it into every service container.
+
+Rotating `JWT_SECRET` invalidates outstanding tokens (single signing key); deployments should treat rotation as a logout-all event.
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -219,30 +242,42 @@ sequenceDiagram
 
 ## 5. CDN Attachment Download & Edge Caching Flow
 
-CDN Edge caching operates on disk (`/var/cache/nginx/cdn`) using proxy cache keys (`$scheme$proxy_host$uri`).
+CDN Edge caching operates on disk (`/var/cache/nginx/cdn`) using proxy cache keys (`$scheme$proxy_host$uri`). Because attachment objects are **private** (per-note ACLs enforced at presign time), the CDN is configured as a *private* edge: it accelerates authorized fetches but never turns a signed response into a publicly reusable one.
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor Client
     participant Edge as Edge Nginx (Port 8081)
-    participant Origin as Origin Nginx (Port 9005)
+    participant Origin as Origin Nginx (data_net)
     participant S3 as MinIO S3 (Port 9000)
 
-    Client->>Edge: GET /notenest-attachments/key?...
+    Client->>Edge: GET /notenest-attachments/key?X-Amz-Signature=...
     Edge->>Edge: Lookup /var/cache/nginx/cdn key
 
     alt Cache HIT (Subsequent Requests)
-        Edge-->>Client: 200 OK (X-Cache-Status: HIT, Cache-Control: public, max-age=3600)
+        Edge-->>Client: 200 OK (X-Cache-Status: HIT,<br/>Cache-Control: private, max-age=3600, stale-while-revalidate=86400)
     else Cache MISS (First Request)
         Edge->>Origin: Forward GET request
         Origin->>S3: Fetch object from bucket
         S3-->>Origin: 200 OK (Binary Data + ETag)
-        Origin-->>Edge: 200 OK (Cache-Control: public, max-age=3600)
-        Edge->>Edge: Save file to /var/cache/nginx/cdn
-        Edge-->>Client: 200 OK (X-Cache-Status: MISS, Cache-Control: public, max-age=3600)
+        Origin-->>Edge: 200 OK (Cache-Control: private; upstream headers hidden)
+        Edge->>Edge: Save file to /var/cache/nginx/cdn<br/>+ X-Cache-Status: MISS
+        Edge-->>Client: 200 OK
+    else Tampered or Forged Request
+        Edge->>Origin: Forward modified URL / forged key path
+        Origin-->>Edge: 403 Forbidden (SigV4 signature mismatch)
+        Edge-->>Client: 403 (never cached)
     end
 ```
+
+### CDN Policy Guarantees
+
+- **Private cacheability end-to-end**: origin emits `Cache-Control: private, max-age=3600, stale-while-revalidate=86400` and hides upstream MinIO headers; the edge passes this through, so shared/proxy caches must not reuse attachment responses.
+- **Signature enforcement**: every object GET requires a valid SigV4 presigned query string; tampered parameters (path, expiry, signature) are rejected by MinIO with `403` before any body is served.
+- **No forged keys**: requests for object keys that do not match an attachment row registered in Postgres are refused at the application layer even when a signature would validate for the bucket prefix.
+- **CORS locked to the app origin**: only the application's own origin may read attachments cross-origin from the edge.
+- **Observability**: every edge response carries `X-Cache-Status: HIT|MISS|BYPASS` for cache-behavior verification (asserted in `tests/suites/26_cdn_acl.sh`).
 
 ---
 
@@ -537,11 +572,12 @@ graph TD
 ```
 
 ### Key Architectural Characteristics
-- **WAL Physical Streaming Replication**: Primary Postgres configured with `wal_level = replica`, `max_wal_senders = 10`, `max_replication_slots = 10`, and `hot_standby = on`. Read Replicas are initialized via `pg_basebackup -R` and stream WAL records asynchronously with near-zero latency (<5ms / 0 bytes lag).
+- **WAL Physical Streaming Replication**: Primary Postgres configured with `wal_level = replica`, `max_wal_senders = 10`, `max_replication_slots = 10`, and `hot_standby = on`. Read Replicas are initialized via `pg_basebackup -R` and stream WAL records asynchronously — replicas are eventually consistent by design, not zero-lag.
 - **Dual PgBouncer Connection Pools**: `pgbouncer-write` (port 6432) routes mutation traffic to Primary (`db:5432`). `pgbouncer-read` (port 6433) load-balances read traffic across `db-replica-1:5432` and `db-replica-2:5432` via Docker DNS round-robin (`db-replicas`).
 - **Application Read/Write Splitting**: C++ `DBPool` / `DBConnectionGuard` (`DBPoolMode::READ` & `DBPoolMode::WRITE`), Python (`auth`, `user`), and Node.js (`graphql`) route read queries (`SELECT`) to `pgbouncer-read` and mutations (`INSERT`, `UPDATE`, `DELETE`) to `pgbouncer-write`.
-- **Automatic Fallback to Primary**: If read replicas or read pool are unavailable or circuit breaker opens, `DBConnectionGuard` and microservice DB helpers catch read errors and automatically fall back to `pgbouncer-write` (Primary DB) to guarantee 100% service uptime with zero dropped requests.
-- **Lag Monitoring**: Replicas are monitored via `pg_stat_replication` (`scripts/check_replica_lag.sh`); replicas exceeding 10MB replication lag are marked unready.
+- **Read-Your-Writes Semantics**: Login and other consistency-sensitive reads execute against the **write pool (primary)** so a fresh signup can never fail its first login due to replica lag; GraphQL reads stay sticky to one backend through HAProxy's consistent hashing so an immediate read-after-mutation sees the primary's data. Cache-aside entries are invalidated on mutation.
+- **Automatic Fallback to Primary**: If read replicas or the read pool are unavailable or the circuit breaker opens, `DBConnectionGuard` and microservice DB helpers catch read errors and automatically fall back to `pgbouncer-write` (Primary DB) to guarantee service uptime with zero dropped requests. A total replica outage therefore degrades read capacity but never availability (asserted in `tests/suites/21_db_replication.sh`).
+- **Lag-Aware Routing**: Replicas are monitored via `pg_stat_replication` (`scripts/check_replica_lag.sh`); replicas exceeding 10 MB replication lag are marked unready and removed from the read pool's DNS rotation.
 
 ---
 
@@ -651,3 +687,19 @@ graph TD
 - **Branch Protection & Verification**: Enforces required CI status checks (`lint-code`, `unit-and-integration-tests`, `helm-and-tf-validation`, `docker-e2e-integration`) prior to PR merge. Validated via `tests/suites/23_cicd_workflows.sh`.
 
 
+
+---
+
+## 15. Honest Limitations & Operational Caveats
+
+This section states what the system does **not** guarantee, so the architecture is evaluated against reality rather than aspiration.
+
+- **Single-host topology**: The deployed stack runs as Docker containers on one host (Compose for dev/e2e, Terraform with the `kreuzwerker/docker` provider). Network segmentation and service isolation are real, but there is no multi-AZ or multi-cloud redundancy; a host failure loses everything.
+- **Asynchronous replication only**: Replicas stream WAL asynchronously. There is no `synchronous_standby_names`; a primary crash can lose the last committed transactions even though replicas keep serving reads.
+- **At-least-once event delivery**: The outbox relay's DR callback can re-publish events after failover, and Kafka/RabbitMQ redelivery means consumers (notification fan-out, PDF worker) must be idempotent. Poison messages land in the DLT and require manual replay — nothing auto-retries them forever.
+- **Single-broker messaging**: One Kafka broker and one RabbitMQ node. Broker loss pauses event flow until restart; there is no quorum or mirrored queue.
+- **Static infrastructure credentials**: Only `JWT_SECRET` is boot-enforced and generated (`make setup`, Terraform `random_password`). Postgres/MinIO credentials remain well-known dev defaults by design; productionizing requires secret-manager integration before any external exposure.
+- **Single JWT signing key**: Rotation invalidates every outstanding token (logout-all). There is no kid-based multi-key rollover yet.
+- **Rate limiting scope**: Kong's Redis-backed limiting protects the API surface in this single-gateway deployment; multi-node deployments would need to revisit per-node versus cluster-wide counter semantics.
+- **Dev-tuned timings**: Health gates, chaos-recovery windows, and cache TTLs are tuned for laptop-class hardware and local networks; they need re-baselining for production latencies.
+- **TLS termination**: Edge listeners terminate plain HTTP locally. TLS is assumed to be offloaded upstream; certificates/SNI management is out of scope for this stack.

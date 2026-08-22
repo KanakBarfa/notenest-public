@@ -23,7 +23,8 @@ if docker ps --format '{{.Names}}' | grep -q "^notenest-db-container$"; then
     if [ "$REPL_COUNT" -ge 1 ]; then
         echo "--> Verified active streaming replication on primary."
     else
-        echo "--> Warning: Found $REPL_COUNT streaming replicas, expected 2."
+        echo "FAILED: Expected at least 1 streaming replica on the primary, found $REPL_COUNT"
+        exit 1
     fi
 else
     echo "--> Skipping Docker pg_stat_replication check (not running in Docker environment)."
@@ -125,18 +126,57 @@ if docker ps --format '{{.Names}}' | grep -q "^notenest-db-replica-1-container$"
 fi
 
 # 7. Simulate all read replicas failure and verify fallback to Primary
-echo "[Step 7] Simulating all read replicas failure (stopping both replicas)..."
+await_gateway
+echo "[Step 7] Simulating total read-path outage (stopping both replicas)..."
 if docker ps --format '{{.Names}}' | grep -q "^notenest-db-replica-1-container$"; then
     docker stop notenest-db-replica-1-container notenest-db-replica-2-container >/dev/null 2>&1
-    sleep 2
 
-    echo "Verifying read traffic fallback to Primary..."
-    assert_request "GET" "/notes" 200 "" "$FAILOVER_TOKEN"
-    echo "--> Application read fallback to Primary verified successful."
+    # Graceful stop takes several seconds; wait until both truly refuse
+    # connections before judging the read path.
+    DOWN=false
+    for attempt in {1..20}; do
+        if ! docker exec notenest-db-replica-1-container pg_isready -U postgres >/dev/null 2>&1 \
+           && ! docker exec notenest-db-replica-2-container pg_isready -U postgres >/dev/null 2>&1; then
+            DOWN=true
+            break
+        fi
+        sleep 1
+    done
+    if ! $DOWN; then
+        echo "FAILED: replicas did not shut down within 20s"
+        docker start notenest-db-replica-1-container notenest-db-replica-2-container >/dev/null 2>&1
+        exit 1
+    fi
+    sleep 3
+
+    # Designed contract: when the read pool is unreachable the app falls back
+    # to the primary (db_pool.cpp), trading replica offload for availability.
+    # Reads must keep succeeding while both replicas are verifiably down.
+    OUTAGE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $FAILOVER_TOKEN" "$SERVER_URL/notes")
+    if [ "$OUTAGE_CODE" -ne 200 ]; then
+        echo "FAILED: reads did not survive a total replica outage via primary fallback (HTTP $OUTAGE_CODE)"
+        docker start notenest-db-replica-1-container notenest-db-replica-2-container >/dev/null 2>&1
+        exit 1
+    fi
+    echo "--> Reads survived total replica outage via primary fallback (HTTP 200)."
 
     echo "Restoring read replica containers..."
     docker start notenest-db-replica-1-container notenest-db-replica-2-container >/dev/null 2>&1
-    sleep 5
+    sleep 8
+
+    echo "Verifying recovery after replicas rejoin..."
+    RECOVERY_OK=false
+    for attempt in {1..10}; do
+        REC_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $FAILOVER_TOKEN" "$SERVER_URL/notes")
+        if [ "$REC_CODE" -eq 200 ]; then RECOVERY_OK=true; break; fi
+        sleep 3
+    done
+    if $RECOVERY_OK; then
+        echo "--> Read traffic recovered after replicas rejoined."
+    else
+        echo "FAILED: Reads did not recover after replicas came back"
+        exit 1
+    fi
 fi
 
 echo "=== Suite 21 Completed Successfully ==="

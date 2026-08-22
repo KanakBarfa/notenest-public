@@ -59,3 +59,8 @@ variable "data_network_name" {
   description = "Data network name"
   default     = "data_net"
 }
+
+variable "jwt_secret" {
+  description = "Generated JWT signing secret shared by all services"
+  type        = string
+}
