@@ -149,6 +149,16 @@ HttpResponse Router::routeInternal(HttpRequest& req) const {
         return res;
     }
 
+    // Public liveness probe for load balancers and orchestrators.
+    if (clean_path == "/health" || clean_path == "/health/") {
+        HttpResponse res;
+        res.status_code = 200;
+        res.status_text = "OK";
+        res.headers["Content-Type"] = "application/json";
+        res.body = "{\"status\":\"healthy\"}";
+        return res;
+    }
+
     // Public routes: /signup and /login
     if (clean_path == "/signup" || clean_path == "/signup/") {
         if (req.method == HttpMethod::POST) {

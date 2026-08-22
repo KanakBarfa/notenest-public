@@ -5,6 +5,11 @@ services:
   - name: notenest-backend
     url: http://app:8080
     routes:
+      - name: health
+        paths:
+          - /health
+        strip_path: false
+
       - name: public-signup
         paths:
           - /signup

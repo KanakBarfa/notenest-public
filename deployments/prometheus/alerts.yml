@@ -2,28 +2,33 @@ groups:
   - name: notenest_alerts
     rules:
       - alert: HighErrorRate
-        expr: (sum(rate(http_requests_total{status=~"5.*"}[1m])) / sum(rate(http_requests_total[1m]))) * 100 > 1
-        for: 0m
+        expr: |
+          (
+            sum by (service) (rate(http_requests_total{status=~"5.."}[5m]))
+            /
+            clamp_min(sum by (service) (rate(http_requests_total[5m])), 0.001)
+          ) > 0.05
+        for: 2m
         labels:
           severity: critical
         annotations:
-          summary: "High HTTP error rate detected (>1%)"
-          description: "Service error rate has exceeded 1% threshold."
+          summary: "High HTTP error rate on {{ $labels.service }} (>5% over 5m)"
+          description: "Service {{ $labels.service }} has returned more than 5% 5xx responses for at least 2 minutes."
 
       - alert: ServiceDown
         expr: up == 0
-        for: 0m
+        for: 1m
         labels:
           severity: critical
         annotations:
           summary: "Service instance down"
-          description: "Target {{ $labels.instance }} of job {{ $labels.job }} is down."
+          description: "Target {{ $labels.instance }} of job {{ $labels.job }} has been unreachable for over a minute."
 
       - alert: HighKafkaLag
-        expr: kafka_consumer_lag > 50
-        for: 0m
+        expr: kafka_consumer_lag > 100
+        for: 2m
         labels:
           severity: warning
         annotations:
-          summary: "High Kafka Consumer Lag"
-          description: "Kafka consumer lag for topic {{ $labels.topic }} is above 50 messages."
+          summary: "High Kafka consumer lag"
+          description: "Consumer group {{ $labels.group }} lags topic {{ $labels.topic }} by more than 100 messages for 2 minutes."

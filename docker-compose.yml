@@ -9,6 +9,7 @@ services:
       POSTGRES_PASSWORD: ${DB_PASSWORD:-pass}
     volumes:
       - pg_data:/var/lib/postgresql/data
+      - ./db/initdb:/docker-entrypoint-initdb.d:ro
     networks:
       - data_net
     healthcheck:
@@ -39,7 +40,7 @@ services:
         aliases:
           - db-replicas
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-postgres} && /docker-check-lag.sh localhost"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-postgres} && /docker-check-lag.sh db"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -66,7 +67,7 @@ services:
         aliases:
           - db-replicas
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-postgres} && /docker-check-lag.sh localhost"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-postgres} && /docker-check-lag.sh db"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -86,8 +87,6 @@ services:
       DEFAULT_POOL_SIZE: 20
       LISTEN_PORT: 6432
       AUTH_TYPE: plain
-    ports:
-      - "6432:6432"
     depends_on:
       db:
         condition: service_healthy
@@ -114,8 +113,6 @@ services:
       DEFAULT_POOL_SIZE: 20
       LISTEN_PORT: 6433
       AUTH_TYPE: plain
-    ports:
-      - "6433:6433"
     depends_on:
       db-replica-1:
         condition: service_healthy
@@ -165,7 +162,6 @@ services:
     container_name: notenest-minio-container
     ports:
       - "9000:9000"
-      - "9001:9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
@@ -507,7 +503,6 @@ services:
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
-      - "--web.enable-lifecycle"
     ports:
       - "9090:9090"
     networks:
@@ -627,7 +622,6 @@ services:
       - loki
       - tempo
     networks:
-      - public_net
       - app_net
       - mgmt_net
     healthcheck:
