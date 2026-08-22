@@ -88,5 +88,6 @@ jobs:
             --namespace notenest \
             --set image.repository=ghcr.io/${{ steps.repo.outputs.repo }} \
             --set image.tag=${{ github.sha }} \
+            --set global.jwtSecret=0000000000000000000000000000000000000000000000000000000000000000 \
             > /dev/null
           echo "Helm release manifests validated successfully for commit SHA: ${{ github.sha }}"

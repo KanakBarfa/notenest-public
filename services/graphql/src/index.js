@@ -201,19 +201,26 @@ const NOTE_PERMISSION_RANK = { viewer: 1, editor: 2, owner: 3 };
 // Returns the caller's permission level or null when access is denied.
 const getNoteAccess = async (userId, noteId) => {
   if (!userId || !noteId) return null;
+  const query = `SELECT CASE
+                    WHEN n.owner_id = $2::uuid THEN 'owner'
+                    ELSE s.permission
+                  END AS permission
+   FROM notes n
+   LEFT JOIN note_shares s ON s.note_id = n.id AND s.shared_with_user_id = $2::uuid
+   WHERE n.id = $1::uuid`;
   const { rows } = await queryDB(
-    `SELECT CASE
-              WHEN n.owner_id = $2::uuid THEN 'owner'
-              ELSE s.permission
-            END AS permission
-     FROM notes n
-     LEFT JOIN note_shares s ON s.note_id = n.id AND s.shared_with_user_id = $2::uuid
-     WHERE n.id = $1::uuid`,
+    query,
     [noteId, userId],
     true,
     userId
   );
-  return rows.length > 0 && rows[0].permission ? rows[0].permission : null;
+  const permission = rows.length > 0 && rows[0].permission ? rows[0].permission : null;
+  if (permission) return permission;
+
+  // Replica reads can lag right after shares/permission updates made by other users.
+  // Retry against primary before denying access to avoid false FORBIDDEN responses.
+  const primary = await queryDB(query, [noteId, userId], false, userId);
+  return primary.rows.length > 0 && primary.rows[0].permission ? primary.rows[0].permission : null;
 };
 
 // Throws UNAUTHENTICATED/FORBIDDEN; returns the granted level.
