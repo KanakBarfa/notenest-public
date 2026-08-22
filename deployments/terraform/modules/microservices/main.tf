@@ -4,7 +4,16 @@ terraform {
       source  = "kreuzwerker/docker"
       version = "~> 3.0"
     }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.5"
+    }
   }
+}
+
+resource "random_password" "jwt_secret" {
+  length  = 64
+  special = false
 }
 
 resource "docker_image" "auth" {
@@ -33,7 +42,7 @@ resource "docker_container" "auth" {
     "DB_NAME=postgres",
     "DB_USER=postgres",
     "DB_PASSWORD=pass",
-    "JWT_SECRET=default_super_secure_jwt_secret_key_12345_67890",
+    "JWT_SECRET=${random_password.jwt_secret.result}",
     "CONSUL_HOST=${var.consul_container_name}",
     "CONSUL_PORT=8500"
   ]
@@ -108,7 +117,7 @@ resource "docker_container" "graphql" {
     "DB_NAME=postgres",
     "DB_USER=postgres",
     "DB_PASSWORD=pass",
-    "JWT_SECRET=default_super_secure_jwt_secret_key_12345_67890",
+    "JWT_SECRET=${random_password.jwt_secret.result}",
     "CONSUL_HOST=${var.consul_container_name}",
     "CONSUL_PORT=8500"
   ]
